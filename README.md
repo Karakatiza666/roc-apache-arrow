@@ -18,20 +18,20 @@ an application.
 | Item | Value |
 |---|---|
 | Systems | Linux (x64, arm64) and macOS; Windows is not tested |
-| Tests | 265 `expect`s, 3 examples, a C host test under AddressSanitizer |
+| Tests | 272 `expect`s, 3 examples, a C host test under AddressSanitizer |
 
 ## Use it
 
 ```roc
 app [main!] {
-    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.1/Dxu8iHydQCtpeYaEbbd6MDe3usRGJfaZtT7UmvnNNiQQ.tar.zst",
+    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.2/4ZaS9d8uUZi4wJSBC1zrwsGD8ncrfV1yzS1Ry7vtjPs8.tar.zst",
 }
 
 import arrow.Array
 import arrow.PrimitiveColumn
 ```
 
-The URL is the 0.0.1 release bundle. Its file name is the hash of its
+The URL is the 0.0.2 release bundle. Its file name is the hash of its
 content, so it changes when a module changes. The release notes give the
 URL of each release.
 
@@ -66,6 +66,17 @@ nums = PrimitiveColumn.i64(Array.from_host(host_array, Int64)?)?
 text = Utf8Column.from_array(Array.from_host(host_text, Utf8)?)?   # checks UTF-8 once
 total = nums.at(0, 0) + text.at(0).count_utf8_bytes().to_i64_wrap()
 ```
+
+A host that promises valid UTF-8 can pass the text buffer as a `Str`
+(`Host.Buffer.Utf8`, see [Host ABI](#host-abi)). `Utf8Column` then uses that
+`Str` and skips the UTF-8 check. For 100k rows of 32 bytes
+(`scripts/bench-host.sh`, x86-64, `--opt speed`):
+
+| Text | `U8s` (checked) | `Utf8` (trusted) |
+|---|---|---|
+| ASCII | 8.5 ns/row | 7.2 ns/row |
+| Latin (2-byte characters) | 107 ns/row | 6.5 ns/row |
+| CJK and emoji | 67 ns/row | 6.2 ns/row |
 
 | View | Arrow types | Loop read |
 |---|---|---|
@@ -163,7 +174,7 @@ and `ArrowSchema` of the C Data Interface, with no callbacks and no
 |---|---|---|
 | `Host.Array` | 96 bytes | `ArrowArray`: length, null_count, offset, buffers, children, dictionary |
 | `Host.Schema` | 128 bytes | `ArrowSchema`: format, name, metadata, flags, children, dictionary |
-| `Host.Buffer` | 32 bytes | one buffer: a tag (`Absent`, `F32s` .. `U8s`) and a Roc list |
+| `Host.Buffer` | 32 bytes | one buffer: a tag (`Absent` = 0, `F32s` .. `U8s` = 11, `Utf8` = 12) and a Roc list, or a `Str` for `Utf8` |
 
 [glue/roc_platform_abi.h](glue/roc_platform_abi.h) is the C header of these
 types. `roc glue` writes it from [glue/platform.roc](glue/platform.roc), a
@@ -178,6 +189,8 @@ Rules the host keeps:
 | The bitmap may have bits set past the last row | Arrow allows it; Roc reads only the bits of `offset ..< offset + length` |
 | Guard against a double release | after `release`, set `release` to NULL and never call it again. Roc cannot detect a second release |
 | `I128s` only for a 16-byte aligned buffer | else pass `U8s`, and Roc copies it into an aligned list. On x86-64 a misaligned `I128s` does not crash today, but the list Roc returns then breaks the alignment rule |
+| `Utf8` only for valid UTF-8 | Roc does not check the bytes of a `Utf8` buffer. Invalid bytes break the invariants of `Str`, and Roc's string functions can then give wrong results or crash. A host that cannot promise valid UTF-8 passes `U8s`, and Roc checks it |
+| `Utf8` only as the data buffer of a text or binary array | buffer 2 of Utf8, LargeUtf8, Binary and LargeBinary. Roc keeps the `Str` for Utf8 and LargeUtf8 only; any other buffer refuses it |
 
 How a platform uses it:
 
@@ -191,9 +204,15 @@ How a platform uses it:
    typed form.
 3. Pass `I128s` only when the pointer is 16-byte aligned; else pass `U8s`
    (see the rules above).
-4. Keep every input `ArrowArray` alive until the result is released, because
+4. For trusted text, build the `Str` in big form as a seamless slice over the
+   data buffer: `bytes` is the buffer, `length` is its byte count (high bit
+   clear), and `capacity_or_alloc_ptr` is the same static word as for a list.
+   This form is valid at any length, 23 bytes or less included. Roc reads
+   rows from it with no copy, and an export gives the same bytes back as
+   `U8s`.
+5. Keep every input `ArrowArray` alive until the result is released, because
    a result can hold slices of its inputs.
-5. To export a list that Roc allocated, take one reference and use the list's
+6. To export a list that Roc allocated, take one reference and use the list's
    element pointer as the buffer. The `release` callback drops the reference.
 
 To make the header again (for example after a compiler change):
@@ -213,7 +232,8 @@ nightly in `.roc-version`, and compiles the header with `cc -std=c11`. Use
 |---|---|
 | `scripts/install-roc.sh` | installs the pinned nightly, prints the path of `roc` |
 | `scripts/test.sh` | `roc fmt --check`, `roc check`, every `expect`, the examples, the glue check |
-| `scripts/test-host.sh` | the C host test (Linux x86-64): zero-copy import, the `I128s` rule and zero-copy export under AddressSanitizer, and one run per injected host fault, each of which must fail |
+| `scripts/test-host.sh` | the C host test (Linux x86-64): zero-copy import, the `I128s` rule, trusted text and zero-copy export under AddressSanitizer, and one run per injected host fault, each of which must fail |
+| `scripts/bench-host.sh` | times `Utf8Column` over 100k rows with `U8s` and with `Utf8` text (Linux x86-64) |
 | `scripts/bundle.sh` | writes `dist/<hash>.tar.zst` and checks that it holds every module |
 | `scripts/test_bundle.sh` | runs the examples against the bundle, by path and over localhost |
 | `scripts/glue.sh` | makes the C header again |
@@ -229,6 +249,27 @@ are not in it.
 | `release.yml` | a pushed version tag: test, bundle, test the bundle, draft the release |
 | `test-nightly-roc.yml` | daily: the latest release on the latest nightly |
 | `deploy-docs.yml` | each push to main: `roc docs` to GitHub Pages |
+
+## Changelog
+
+### 0.0.2
+
+| Change | Effect |
+|---|---|
+| `Host.Buffer.Utf8(Str)`, tag 12 | trusted text: a host that promises valid UTF-8 passes the text buffer as a `Str`, and Roc does not check it. Tags 0 .. 11 keep their numbers, and `Host.Buffer` stays 32 bytes |
+| `Array.from_host` | takes `Utf8(str)` as the data buffer of Utf8, LargeUtf8, Binary and LargeBinary, with no copy |
+| `Array.trusted_text` | new: the host's `Str` of a Utf8 or LargeUtf8 array |
+| `Array.to_host` | a trusted text buffer goes out as `U8s` over the same bytes |
+| `Utf8Column.from_array` | uses the trusted `Str` and skips the UTF-8 check (about 10 to 16 times faster for non-ASCII text); a `U8s` buffer is checked as before |
+| `glue/roc_platform_abi.h` | `HostBufferTag_Utf8`, `HostBuffer_make_utf8`, `HostBuffer_payload_utf8` |
+
+A 0.0.1 host works with no change: tags 0 .. 11 keep their numbers, and no
+export of the package holds a `Utf8` buffer. Rebuild it against the new
+header to use `Utf8`.
+
+### 0.0.1
+
+The first release.
 
 ## License
 

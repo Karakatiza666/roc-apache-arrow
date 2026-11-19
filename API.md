@@ -1,6 +1,6 @@
 # roc-apache-arrow API
 
-The public API of release 0.0.1, module by module. The signatures are the
+The public API of release 0.0.2, module by module. The signatures are the
 ones in `package/*.roc`, where each public item has a `##` doc comment. `_`
 is a derived method.
 
@@ -11,9 +11,9 @@ Status:
 | tested | an `expect` calls it and checks the result |
 | tested via X | an `expect` runs it only through X |
 | not reached | no supported Roc type makes the derived code call it |
-| not in 0.0.1 | an Arrow feature this release does not have |
+| not in 0.0.2 | an Arrow feature this release does not have |
 
-`roc test package/tests.roc` runs every `expect` (265 on
+`roc test package/tests.roc` runs every `expect` (272 on
 nightly-2026-11-15-f25da45). Each status was checked by stubbing the item
 with a `crash` and running the tests: an item marked tested or tested via X
 fails at least one `expect` when it is stubbed.
@@ -108,8 +108,9 @@ fails at least one `expect` when it is stubbed.
 
 | Item | Signature | Purpose | Status |
 |---|---|---|---|
-| `Host.Buffer` | `[Absent, F32s(List(F32)), F64s, I128s, I16s, I32s, I64s, I8s, U16s, U32s, U64s, U8s]` | one buffer; tag numbers 0 .. 11 in this order | tested |
-| `Host.Buffer.len` | `Host.Buffer -> U64` | element count | tested |
+| `Host.Buffer` | `[Absent, F32s(List(F32)), F64s, I128s, I16s, I32s, I64s, I8s, U16s, U32s, U64s, U8s, Utf8(Str)]` | one buffer; tag numbers 0 .. 12 in this order | tested |
+| `Host.Buffer.Utf8` | `Utf8(Str)` (tag 12) | trusted text: the data buffer of a Utf8 or LargeUtf8 array, not checked by Roc; new in 0.0.2 | tested |
+| `Host.Buffer.len` | `Host.Buffer -> U64` | element count (bytes for `Utf8`) | tested |
 | `Host.Array` | `{ length : I64, null_count : I64, offset : I64, buffers, children, dictionary, _ : {} }` | mirrors `ArrowArray`; 96 bytes | tested |
 | `Host.Schema` | `{ format : List(U8), name, metadata, flags : I64, children, dictionary, _ : {} }` | mirrors `ArrowSchema`; 128 bytes | tested |
 | `flag_dictionary_ordered` | `I64` (1) | C flag | tested |
@@ -117,7 +118,7 @@ fails at least one `expect` when it is stubbed.
 | `flag_map_keys_sorted` | `I64` (4) | C flag | tested |
 | `empty_array` | `I64 -> Host.Array` | an array with no buffers | tested |
 | `glue/roc_platform_abi.h` | C header | the layout, with static asserts | checked by `scripts/glue.sh --check` |
-| host rules | zero-copy import, the `I128s` rule, zero-copy export and release | | tested by `scripts/test-host.sh` (C, AddressSanitizer) |
+| host rules | zero-copy import, the `I128s` rule, zero-copy export and release, trusted text (`Utf8`) | | tested by `scripts/test-host.sh` (C, AddressSanitizer) |
 
 ## Validity
 
@@ -137,12 +138,13 @@ fails at least one `expect` when it is stubbed.
 | Item | Signature | Purpose | Status |
 |---|---|---|---|
 | `Array.Body` | `[NoBuffers, BoolBits, I8s .. U64s, F32s, F64s, I128s, Var32, Var64, Views, Fixed, List32, List64, FixedList, Children]` | typed buffers | tested |
-| `from_host` | `Host.Array, DataType -> Try(Array, [InvalidArray(Str), Unsupported(Str)])` | check and slice a host array | tested |
-| `to_host` | `Array -> Host.Array` | export, offset 0 | tested |
+| `from_host` | `Host.Array, DataType -> Try(Array, [InvalidArray(Str), Unsupported(Str)])` | check and slice a host array; takes `Utf8(str)` as binary or text data | tested |
+| `to_host` | `Array -> Host.Array` | export, offset 0; text data goes out as `U8s` | tested |
 | `data_type` | `Array -> DataType` | the type | tested via the column views |
 | `len` | `Array -> U64` | rows | tested |
 | `validity` | `Array -> Validity` | the validity | tested |
 | `body` | `Array -> Array.Body` | the typed buffers | tested via the column views |
+| `trusted_text` | `Array -> Try(Str, [NoText])` | the host's `Utf8` data buffer of a Utf8 or LargeUtf8 array, whole; new in 0.0.2 | tested |
 | `is_valid` | `Array, U64 -> Bool` | row is not NULL | tested |
 | `null_count` | `Array -> U64` | NULL rows | tested |
 | `children` | `Array -> List(Array)` | child arrays | tested |
@@ -201,14 +203,14 @@ fails at least one `expect` when it is stubbed.
 
 | Item | Signature | Purpose | Status |
 |---|---|---|---|
-| `from_array` | `Array -> Try(Utf8Column, [TypeMismatch(DataType)])` | Utf8 only; checks the text once | tested |
+| `from_array` | `Array -> Try(Utf8Column, [TypeMismatch(DataType)])` | Utf8 only; checks the text once, or not at all for a trusted `Utf8` buffer | tested |
 | `len`, `is_valid` | as in `PrimitiveColumn` | | tested |
 | `validity` | `Utf8Column -> Validity` | the validity | tested |
 | `data_len` | `Utf8Column -> U64` | text bytes | tested |
-| `is_valid_utf8` | `Utf8Column -> Bool` | the text passed the check | tested |
+| `is_valid_utf8` | `Utf8Column -> Bool` | the text passed the check, or is trusted | tested |
 | `get` | `Utf8Column, U64 -> Try(Str, [Null, OutOfBounds])` | checked read | tested |
 | `at` | `Utf8Column, U64 -> Str` | loop read, a slice | tested |
-| LargeUtf8, Utf8View text views | | read them with `BinaryColumn.get_str` | not in 0.0.1 |
+| LargeUtf8, Utf8View text views | | read them with `BinaryColumn.get_str` | not in 0.0.2 |
 
 ## ListColumn
 
@@ -331,7 +333,7 @@ decode and encode alike.
 | `parse_list_start`, `parse_list_next`, `parse_list_after_item`, `parse_record_start`, `parse_record_field`, `parse_record_after_field`, `parse_tuple_start`, `parse_tuple_next`, `parse_tuple_end`, `skip_record_field`, `missing_field`, `rename_field` | protocol methods | called by derived `parser_for` | tested via `decode_row` |
 | `invalid_value` | protocol method | | not reached |
 | `encode_null`, `encode_bool`, `encode_i8` .. `encode_i64`, `encode_u8` .. `encode_u64`, `encode_i128`, `encode_f32`, `encode_f64`, `encode_dec`, `encode_str`, `encode_list`, `encode_record`, `encode_tuple` | protocol methods | called by derived `encoder_for` | tested via `encode_row` |
-| tag unions, `Dict`, `Set` in the codec | | | not in 0.0.1 |
+| tag unions, `Dict`, `Set` in the codec | | | not in 0.0.2 |
 
 ## CodecError
 
@@ -368,7 +370,7 @@ decode and encode alike.
 | `to_dec` | `Decimal -> Try(Dec, [OutOfRange])` | exact | tested |
 | `from_dec` | `Dec, U8, I8 -> Try(Decimal, [OutOfRange])` | rounds half away from zero | tested |
 | `unscaled_to_dec` | `I128, I8 -> Try(Dec, [OutOfRange])` | exact | tested |
-| Decimal256 values | | | not in 0.0.1 |
+| Decimal256 values | | | not in 0.0.2 |
 
 ## Logical values
 
@@ -387,6 +389,6 @@ decode and encode alike.
 | `Duration.to_unit` | `Duration, TimeUnit -> Try(Duration, [Overflow, Inexact])` | | tested |
 | `IntervalYearMonth.from_months` | `I32 -> IntervalYearMonth` | | tested |
 | `IntervalYearMonth.parts` | `IntervalYearMonth -> { years : I32, months : I32 }` | | tested |
-| Interval(DayTime / MonthDayNano) values, a `FixedColumn` view | | | not in 0.0.1 |
-| Arrow IPC (`Ipc` module) | | | not in 0.0.1 |
-| ListView, Union, Dictionary, RunEndEncoded arrays | in `DataType` and `Format`; `from_host` gives `Unsupported` | | not in 0.0.1 |
+| Interval(DayTime / MonthDayNano) values, a `FixedColumn` view | | | not in 0.0.2 |
+| Arrow IPC (`Ipc` module) | | | not in 0.0.2 |
+| ListView, Union, Dictionary, RunEndEncoded arrays | in `DataType` and `Format`; `from_host` gives `Unsupported` | | not in 0.0.2 |
