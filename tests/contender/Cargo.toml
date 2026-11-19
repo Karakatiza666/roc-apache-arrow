@@ -1,0 +1,18 @@
+[package]
+name = "contender"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "Differential tests of roc-apache-arrow against arrow-rs through the Arrow C Data Interface"
+license = "UPL-1.0"
+
+# Not a member of any parent workspace.
+[workspace]
+
+[dependencies]
+arrow = { version = "=59.3.3", default-features = false, features = ["ffi"] }
+libc = "0.2"
+
+[profile.dev]
+opt-level = 1
