@@ -1,0 +1,54 @@
+name: Bench
+
+# The lineitem bench against arrow-rs (scripts/bench-contender.sh), by hand
+# only: shared runners are noisy, so no regular run and no gate. The report
+# goes to the job summary and to an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: Rows of the lineitem table (6000000 for the large run).
+        type: string
+        default: '1000000'
+      passes:
+        description: Timed passes per way.
+        type: string
+        default: '7'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Bench vs arrow-rs (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Roc
+        id: roc
+        run: echo "path=$(scripts/install-roc.sh)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            tests/contender/target
+          key: bench-${{ matrix.os }}-${{ hashFiles('tests/contender/Cargo.lock') }}
+      - name: Run the bench
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          LINEITEM_ROWS: ${{ inputs.rows }}
+          LINEITEM_PASSES: ${{ inputs.passes }}
+          BENCH_OUT: bench-lineitem.md
+        run: |
+          scripts/bench-contender.sh
+          cat bench-lineitem.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-lineitem-${{ matrix.os }}
+          path: bench-lineitem.md
