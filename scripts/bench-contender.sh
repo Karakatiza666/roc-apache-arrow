@@ -63,14 +63,14 @@ run() {
 	"${pin[@]}" "$bench" "$@" >>"$results"
 }
 
-ways=(rust-rows rust-kernels roc-checked roc-trusted)
+ways=(rust-rows rust-kernels roc-checked roc-trusted roc-str-checked roc-str-trusted)
 for size in 8192 65536; do
 	for way in "${ways[@]}"; do
 		run "$way" "$size"
 	done
 done
 for size in 8192 65536; do
-	for way in rust-rows roc-checked roc-trusted; do
+	for way in rust-rows roc-checked roc-trusted roc-str-trusted; do
 		for phase in host import numeric; do
 			run "$way" "$size" "$phase"
 		done

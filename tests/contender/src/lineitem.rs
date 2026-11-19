@@ -6,7 +6,8 @@
 //! |-----|------|
 //! | [`Way::RustRows`] | arrow-rs arrays read row by row, output through builders |
 //! | [`Way::RustKernels`] | arrow-rs compute kernels (filter, decimal arithmetic, length); the text and the groups in a loop, as arrow-rs has no kernel for them |
-//! | [`Way::Roc`] | the `lineitem` entry point of `app.roc`: the package's views and `Writer` |
+//! | [`Way::Roc`] | the `lineitem` entry point of `app.roc`: the package's views, byte reads and `Writer` parts, with no `Str` per row |
+//! | [`Way::RocStr`] | the `lineitem_str` entry point: a `Str` per text read and per text written |
 //!
 //! The job, per batch: import through the C Data Interface; keep the rows
 //! with `SHIP_FROM <= shipdate < SHIP_UNTIL`; compute
@@ -531,14 +532,18 @@ pub enum Way {
     /// The Roc entry point: with `Feed::TYPED` Roc checks the text as
     /// UTF-8; with `Feed::TRUSTED` the host vouches for it.
     Roc(Feed),
+    /// The same job in Roc with a `Str` per text read and write.
+    RocStr(Feed),
 }
 
 impl Way {
-    pub const ALL: [Way; 4] = [
+    pub const ALL: [Way; 6] = [
         Way::RustRows,
         Way::RustKernels,
         Way::Roc(Feed::TYPED),
         Way::Roc(Feed::TRUSTED),
+        Way::RocStr(Feed::TYPED),
+        Way::RocStr(Feed::TRUSTED),
     ];
 
     pub fn name(self) -> &'static str {
@@ -547,6 +552,8 @@ impl Way {
             Way::RustKernels => "arrow-rs kernels",
             Way::Roc(f) if f.trusted_text => "Roc, trusted text",
             Way::Roc(_) => "Roc, checked text",
+            Way::RocStr(f) if f.trusted_text => "Roc Str, trusted text",
+            Way::RocStr(_) => "Roc Str, checked text",
         }
     }
 
@@ -556,6 +563,8 @@ impl Way {
             "rust-kernels" => Some(Way::RustKernels),
             "roc-checked" => Some(Way::Roc(Feed::TYPED)),
             "roc-trusted" => Some(Way::Roc(Feed::TRUSTED)),
+            "roc-str-checked" => Some(Way::RocStr(Feed::TYPED)),
+            "roc-str-trusted" => Some(Way::RocStr(Feed::TRUSTED)),
             _ => None,
         }
     }
@@ -579,11 +588,14 @@ pub enum Phase {
 /// A phase short of `Full` gives `None`.
 pub fn run_batch(way: Way, batch: &StructArray, phase: Phase) -> Option<ArrayRef> {
     match way {
-        Way::Roc(feed) => {
-            let entry = match phase {
-                Phase::Host | Phase::Full => "lineitem",
-                Phase::Import => "lineitem_import",
-                Phase::Numeric => "lineitem_numeric",
+        Way::Roc(feed) | Way::RocStr(feed) => {
+            let entry = match (way, phase) {
+                (Way::Roc(_), Phase::Host | Phase::Full) => "lineitem",
+                (Way::Roc(_), Phase::Import) => "lineitem_import",
+                (Way::Roc(_), Phase::Numeric) => "lineitem_numeric",
+                (_, Phase::Host | Phase::Full) => "lineitem_str",
+                (_, Phase::Import) => "lineitem_str_import",
+                (_, Phase::Numeric) => "lineitem_str_numeric",
             };
             let input = HostInput::from_array(entry, batch, feed);
             match phase {

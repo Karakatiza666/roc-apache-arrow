@@ -5,11 +5,11 @@
 //!   bench_lineitem <way> <batch rows> [phase]
 //!   bench_lineitem stats
 //!
-//! way: rust-rows, rust-kernels, roc-checked, roc-trusted. phase: host,
-//! import, numeric, full (default). `LINEITEM_ROWS` (default 1000000) and
-//! `LINEITEM_PASSES` (default 7) set the size of the run. Before it times,
-//! the run checks the way's output against the arrow-rs row loop on every
-//! batch, then makes one warm-up pass.
+//! way: rust-rows, rust-kernels, roc-checked, roc-trusted, roc-str-checked,
+//! roc-str-trusted. phase: host, import, numeric, full (default).
+//! `LINEITEM_ROWS` (default 1000000) and `LINEITEM_PASSES` (default 7) set
+//! the size of the run. Before it times, the run checks the way's output
+//! against the arrow-rs row loop on every batch, then makes one warm-up pass.
 //!
 //! With `LINEITEM_PROFILE=1` (Linux x86-64), a SIGPROF timer samples the
 //! program counter during the timed passes, and the run prints the share of
