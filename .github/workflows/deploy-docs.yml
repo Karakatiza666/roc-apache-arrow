@@ -1,0 +1,52 @@
+name: Deploy docs to Pages
+
+# The API docs (`roc docs`) of main on GitHub Pages. Needs the repository's
+# Pages source set to GitHub Actions.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'package/**.roc'
+      - '.roc-version'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Roc
+        id: roc
+        run: echo "path=$(scripts/install-roc.sh)" >> "$GITHUB_OUTPUT"
+      - name: Generate the docs
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: |
+          set -euo pipefail
+          "$ROC" docs package/main.roc
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: generated-docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

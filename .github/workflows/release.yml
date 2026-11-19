@@ -1,0 +1,136 @@
+name: Release
+
+# git tag 0.0.1 && git push origin 0.0.1
+#
+# Tests the tag, bundles it, tests the bundle on every runner, and puts the
+# bundle and the docs on a DRAFT release. A person reads the run, then
+# presses Publish (or deletes the draft).
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  # Re-run for an existing tag: pick the tag as the ref when dispatching.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+
+  bundle:
+    name: Bundle
+    needs: test
+    runs-on: ubuntu-24.04
+    outputs:
+      archive: ${{ steps.bundle.outputs.archive }}
+    steps:
+      # The release is named after the ref, so only a semver tag is accepted.
+      - name: Require a version tag
+        run: |
+          [[ "$GITHUB_REF" =~ ^refs/tags/[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "error: run this workflow from a tag such as 0.0.1, not $GITHUB_REF" >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+
+      - name: Install Roc
+        id: roc
+        run: echo "path=$(scripts/install-roc.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Bundle the package
+        id: bundle
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: scripts/bundle.sh dist
+
+      - name: Generate the docs
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: |
+          set -euo pipefail
+          "$ROC" docs package/main.roc
+          tar -czf dist/docs.tar.gz -C generated-docs .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.run_id }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The bundle the way a consumer gets it: downloaded over http and checked
+  # against its hash. A draft asset needs a token, so each leg serves the
+  # artifact on 127.0.0.1.
+  test-bundle:
+    name: Test the bundle (${{ matrix.os }})
+    needs: bundle
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.run_id }}
+          path: dist
+      - name: Install Roc
+        id: roc
+        run: echo "path=$(scripts/install-roc.sh)" >> "$GITHUB_OUTPUT"
+      - name: Run the examples against the bundle
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          ARCHIVE: ${{ needs.bundle.outputs.archive }}
+        run: scripts/test_bundle.sh "dist/$ARCHIVE"
+
+  draft:
+    name: Draft the release
+    needs: [bundle, test-bundle]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.run_id }}
+          path: dist
+      - name: Draft the release with the bundle, the docs and the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ needs.bundle.outputs.archive }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          nightly="$(tr -d '\r\n' < .roc-version)"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$ARCHIVE"
+          grep -q "$url" README.md || echo "::warning::README.md does not show $url yet; update it after Publish"
+          notes="$(mktemp)"
+          {
+            echo "## Roc compiler version"
+            echo ""
+            echo "Tested with Roc \`$nightly\` (the Zig-based compiler)."
+            echo ""
+            echo "## Using this release"
+            echo ""
+            echo '```roc'
+            echo "app [main!] {"
+            echo "    arrow: \"$url\","
+            echo "}"
+            echo '```'
+          } > "$notes"
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --draft --title "$tag" --notes-file "$notes" --verify-tag
+          fi
+          gh release upload "$tag" "dist/$ARCHIVE" dist/docs.tar.gz --clobber
+          echo "Draft: $(gh release view "$tag" --json url -q .url)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,8 @@
+# Binaries that roc build writes (no extension)
+*
+!*.*
+!*/
+!LICENSE
+
+dist/
+generated-docs/

@@ -1,0 +1,114 @@
+name: Test
+
+# The source tree and its bundle on the Roc nightly pinned in .roc-version:
+# roc fmt, roc check, every expect, the examples, the glue header, then the
+# examples against the bundle (by path and over localhost).
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      roc-nightly:
+        description: A Roc nightly tag to use in place of .roc-version.
+        type: string
+        default: ''
+      ref:
+        description: The ref to check out. Defaults to the caller's ref.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}-${{ inputs.roc-nightly }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.opt }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        opt: [dev, interpreter]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Roc
+        id: roc
+        env:
+          NIGHTLY: ${{ inputs.roc-nightly }}
+        run: echo "path=$(scripts/install-roc.sh $NIGHTLY)" >> "$GITHUB_OUTPUT"
+
+      # The glue specs come from the nightly's source archive; one Linux leg
+      # is enough to prove the header.
+      - name: Check, test and run the examples
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          ROC_OPT: ${{ matrix.opt }}
+          SKIP_GLUE: ${{ (matrix.os == 'ubuntu-24.04' && matrix.opt == 'dev') && '0' || '1' }}
+        run: scripts/test.sh
+
+      - name: Bundle
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: scripts/bundle.sh dist
+
+      - name: Run the examples against the bundle
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: scripts/test_bundle.sh
+
+  # The LLVM backend is slow to build the tests (about 2 minutes), so it runs
+  # on one leg.
+  test-speed:
+    name: Test (ubuntu-24.04, speed)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Roc
+        id: roc
+        env:
+          NIGHTLY: ${{ inputs.roc-nightly }}
+        run: echo "path=$(scripts/install-roc.sh $NIGHTLY)" >> "$GITHUB_OUTPUT"
+      - name: Check, test and run the examples
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          ROC_OPT: speed
+          SKIP_GLUE: '1'
+        run: scripts/test.sh
+
+  # A C host passes Arrow buffers to compiled Roc code and checks zero-copy
+  # import, the I128s alignment rule and zero-copy export, under
+  # AddressSanitizer. The test platform targets x64glibc only.
+  test-host:
+    name: Host conformance (ubuntu-24.04, ${{ matrix.opt }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: [dev, speed]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Roc
+        id: roc
+        env:
+          NIGHTLY: ${{ inputs.roc-nightly }}
+        run: echo "path=$(scripts/install-roc.sh $NIGHTLY)" >> "$GITHUB_OUTPUT"
+      - name: Run the host test
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          ROC_OPT: ${{ matrix.opt }}
+        run: scripts/test-host.sh

@@ -1,0 +1,73 @@
+name: Test on the latest Roc nightly
+
+# Every day: the source of the latest release (or main, before the first
+# release) and its published bundle on the newest Roc nightly. A red run says
+# which nightly broke the package, so the pin in .roc-version can move or the
+# code can be fixed before users meet the break.
+
+on:
+  schedule:
+    # Nightlies are published between 10:00 and 13:30 UTC.
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-roc
+  cancel-in-progress: false
+
+jobs:
+  versions:
+    name: Find the latest release and the latest Roc nightly
+    runs-on: ubuntu-24.04
+    outputs:
+      nightly: ${{ steps.find.outputs.nightly }}
+      release: ${{ steps.find.outputs.release }}
+      bundle: ${{ steps.find.outputs.bundle }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          nightly="$(gh release list --repo roc-lang/nightlies --limit 20 --json tagName -q '.[].tagName' | grep -v -- '-safe$' | head -n 1)"
+          release="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName -q '.[0].tagName // ""')"
+          bundle=""
+          if [ -n "$release" ]; then
+            asset="$(gh release view "$release" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep '\.tar\.zst$' | head -n 1)"
+            bundle="https://github.com/$GITHUB_REPOSITORY/releases/download/$release/$asset"
+          fi
+          echo "nightly=$nightly" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
+          echo "latest nightly: $nightly; latest release: ${release:-none}"
+
+  source:
+    name: Source on the latest nightly
+    needs: versions
+    uses: ./.github/workflows/test.yml
+    with:
+      roc-nightly: ${{ needs.versions.outputs.nightly }}
+      ref: ${{ needs.versions.outputs.release }}
+
+  published-bundle:
+    name: Published bundle on the latest nightly
+    needs: versions
+    if: needs.versions.outputs.bundle != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.versions.outputs.release }}
+      - name: Install Roc
+        id: roc
+        env:
+          NIGHTLY: ${{ needs.versions.outputs.nightly }}
+        run: echo "path=$(scripts/install-roc.sh "$NIGHTLY")" >> "$GITHUB_OUTPUT"
+      - name: Run the examples against the published bundle
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+          BUNDLE: ${{ needs.versions.outputs.bundle }}
+        run: scripts/test_bundle.sh "$BUNDLE"
