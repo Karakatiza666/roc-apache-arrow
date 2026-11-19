@@ -1,3 +1,4 @@
+import ByteScan
 import Array
 import DataType
 import Validity
@@ -10,6 +11,10 @@ import Validity
 ## `offs` and `data` repeat a Binary or Utf8 column's buffers (empty for the
 ## other layouts), so the loop read of the common layout is one sublist with
 ## no match on the body.
+##
+## The byte reads (`byte_len`, `byte_at`, `eq_str`, `eq_bytes`, `trim_ascii`,
+## `first_word`, `find_byte`, `append_span`) make no `Str` and no list per
+## row, except a copy of the 12 bytes of an inline view.
 BinaryColumn :: { buffers : Array.Body, rows : U64, valid : Validity, utf8 : Bool, var32 : Bool, offs : List(I32), data : List(U8) }.{
 
 	## The view of a Binary, LargeBinary, BinaryView, Utf8, LargeUtf8, Utf8View or
@@ -96,6 +101,45 @@ BinaryColumn :: { buffers : Array.Body, rows : U64, valid : Validity, utf8 : Boo
 		Str.from_utf8(bytes).map_err(|_| BadUtf8)
 	}
 
+	## Row `row`'s byte length, NULL or not: 0 past the end.
+	byte_len : BinaryColumn, U64 -> U64
+	byte_len = |col, row| on_row(col, row, |_, start, end| end - start)
+
+	## Byte `index` of row `row`, NULL or not.
+	byte_at : BinaryColumn, U64, U64 -> Try(U8, [OutOfBounds])
+	byte_at = |col, row, index| on_row(col, row, |data, start, end| if (index < end - start) data.get(start + index) else Err(OutOfBounds))
+
+	## Whether row `row` holds exactly the UTF-8 bytes of `s`, NULL or not.
+	eq_str : BinaryColumn, U64, Str -> Bool
+	eq_str = |col, row, s| on_row(col, row, |data, start, end| ByteScan.eq_str(data, start, end, s))
+
+	## Whether row `row` holds exactly the bytes `xs`, NULL or not.
+	eq_bytes : BinaryColumn, U64, List(U8) -> Bool
+	eq_bytes = |col, row, xs| on_row(col, row, |data, start, end| ByteScan.eq_bytes(data, start, end, xs))
+
+	## The byte span of row `row` with ASCII white space trimmed at both ends,
+	## relative to the row's start. Only space, tab, line feed, vertical tab,
+	## form feed and carriage return count: other Unicode white space stays.
+	trim_ascii : BinaryColumn, U64 -> { start : U64, len : U64 }
+	trim_ascii = |col, row| on_row(col, row, |data, start, end| ByteScan.trim(data, start, end))
+
+	## The part of `span` (relative to the row's start) before its first
+	## ASCII white space byte.
+	first_word : BinaryColumn, U64, { start : U64, len : U64 } -> { start : U64, len : U64 }
+	first_word = |col, row, span| on_row(col, row, |data, start, end| ByteScan.first_word(data, start, end, span))
+
+	## The index (relative to the row's start) of the first `byte` in `span`.
+	find_byte : BinaryColumn, U64, { start : U64, len : U64 }, U8 -> Try(U64, [NotFound])
+	find_byte = |col, row, span, byte| on_row(col, row, |data, start, end| ByteScan.find(data, start, end, span, byte))
+
+	## Append `span` of row `row` to `out`, as is or in ASCII upper or lower
+	## case: one copy. The span is cut to the row. For a text
+	## type, an end inside a character moves back to that character's first
+	## byte, as in `Utf8Column.append_span`; the bytes are not checked as
+	## UTF-8. `Writer.part_range` calls it.
+	append_span : BinaryColumn, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)
+	append_span = |col, row, span, case, out| on_row(col, row, |data, start, end| ByteScan.append(data, start, end, span, case, col.utf8, out))
+
 	## Every row in order, `Err(Null)` at a NULL row. Each item costs as `get_bytes`.
 	iter_bytes : BinaryColumn -> Iter(Try(List(U8), [Null]))
 	iter_bytes = |col| Iter.custom(
@@ -108,6 +152,39 @@ BinaryColumn :: { buffers : Array.Body, rows : U64, valid : Validity, utf8 : Boo
 		},
 	)
 }
+
+## Call `f` with the bytes that hold row `row`: a buffer and the row's
+## bounds in it. Past the end, an empty row.
+on_row : BinaryColumn, U64, (List(U8), U64, U64 -> a) -> a
+on_row = |col, row, f|
+	if row >= col.rows {
+		f([], 0, 0)
+	} else if col.var32 {
+		start = (col.offs.get(row) ?? 0).to_u64_wrap()
+		end = (col.offs.get(row + 1) ?? 0).to_u64_wrap()
+		f(col.data, start, end.max(start))
+	} else {
+		match col.buffers {
+			Var64(offs, data) => {
+				start = (offs.get(row) ?? 0).to_u64_wrap()
+				end = (offs.get(row + 1) ?? 0).to_u64_wrap()
+				f(data, start, end.max(start))
+			}
+			Views(words, datas) => {
+				size = (words.get(row * 4) ?? 0).to_u64()
+				if size <= 12 {
+					inline = [words.get(row * 4 + 1) ?? 0, words.get(row * 4 + 2) ?? 0, words.get(row * 4 + 3) ?? 0].join_map(le_bytes)
+					f(inline, 0, size)
+				} else {
+					index = (words.get(row * 4 + 2) ?? 0).to_u64()
+					start = (words.get(row * 4 + 3) ?? 0).to_u64()
+					f(datas.get(index) ?? [], start, start + size)
+				}
+			}
+			Fixed(w, bytes) => f(bytes, row * w, row * w + w)
+			_ => f([], 0, 0)
+		}
+	}
 
 ## Bytes of a row already known to be in range.
 body_bytes : Array.Body, U64 -> List(U8)
@@ -327,4 +404,28 @@ expect {
 	ok = [[3, 0x00636261, 0, 0], [12, 1, 2, 3], [0, 0, 0, 0], [4, 0x64636261, 0, 0]].all(|w| Array.from_host(host(w), BinaryView).is_ok())
 	bad = [[3, 0x01636261, 0, 0], [0, 0, 0, 0x100], [4, 0x64636261, 1, 0], [11, 0, 0, 0xFF000000]].all(|w| Array.from_host(host(w), BinaryView).is_err())
 	ok and bad
+}
+
+# Byte reads of one row equal the reads of the row's bytes.
+row_agrees : BinaryColumn, U64 -> Bool
+row_agrees = |col, i| {
+	bytes = col.bytes_at(i)
+	first_o = match bytes.find_first_index(|b| b == 'o') {
+		Ok(k) => Ok(k)
+		Err(_) => Err(NotFound)
+	}
+	col.byte_len(i) == bytes.len()
+		and bytes.map_with_index(|b, k| col.byte_at(i, k) == Ok(b)).all(|x| x)
+		and col.byte_at(i, bytes.len()) == Err(OutOfBounds)
+		and col.eq_bytes(i, bytes)
+		and !col.eq_bytes(i, bytes.append(0))
+		and col.eq_str(i, Str.from_utf8_lossy(bytes)) == Str.from_utf8(bytes).is_ok()
+		and col.append_span(i, { start: 0, len: 100 }, AsIs, [7]) == [7].concat(bytes)
+		and col.find_byte(i, { start: 0, len: 100 }, 'o') == first_o
+}
+
+# In every layout, after a host offset, a NULL row and past the end included.
+expect {
+	agree = |col| (0.U64).until(col.len() + 1).fold(Bool.True, |ok, i| ok and row_agrees(col, i))
+	agree(bin_col(binary_host, Binary)) and agree(bin_col(large_host, LargeBinary)) and agree(bin_col(view_host, BinaryView)) and agree(bin_col(fixed_host, FixedSizeBinary(2)))
 }

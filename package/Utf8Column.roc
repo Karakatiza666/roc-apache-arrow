@@ -1,3 +1,4 @@
+import ByteScan
 import Array
 import DataType
 import Validity
@@ -100,6 +101,86 @@ Utf8Column :: { offs : List(I32), data : List(U8), valid : Validity, text : Str,
 			Err(_) => Str.from_utf8_lossy(col.data.sublist({ start, len: end - start }))
 		}
 	}
+
+	## Row `row`'s byte length, NULL or not: 0 past the end. No `Str`.
+	byte_len : Utf8Column, U64 -> U64
+	byte_len = |col, row| {
+		(start, end) = bounds(col, row)
+		end - start
+	}
+
+	## Byte `index` of row `row`, NULL or not. No `Str`.
+	byte_at : Utf8Column, U64, U64 -> Try(U8, [OutOfBounds])
+	byte_at = |col, row, index| {
+		(start, end) = bounds(col, row)
+		if (index < end - start) col.data.get(start + index) else Err(OutOfBounds)
+	}
+
+	## Whether row `row` holds exactly the text `s`, NULL or not. A row past
+	## the end holds no bytes. No `Str` per row.
+	eq_str : Utf8Column, U64, Str -> Bool
+	eq_str = |col, row, s| {
+		(start, end) = bounds(col, row)
+		ByteScan.eq_str(col.data, start, end, s)
+	}
+
+	## Whether row `row` holds exactly the bytes `xs`. No `Str` per row.
+	eq_bytes : Utf8Column, U64, List(U8) -> Bool
+	eq_bytes = |col, row, xs| {
+		(start, end) = bounds(col, row)
+		ByteScan.eq_bytes(col.data, start, end, xs)
+	}
+
+	## The byte span of row `row` with ASCII white space trimmed at both ends,
+	## relative to the row's start. Only space, tab, line feed, vertical tab,
+	## form feed and carriage return count: other Unicode white space (for
+	## example U+00A0) stays. No `Str`.
+	trim_ascii : Utf8Column, U64 -> { start : U64, len : U64 }
+	trim_ascii = |col, row| {
+		(start, end) = bounds(col, row)
+		ByteScan.trim(col.data, start, end)
+	}
+
+	## The part of `span` (relative to the row's start) before its first
+	## ASCII white space byte: the first word of a trimmed span.
+	first_word : Utf8Column, U64, { start : U64, len : U64 } -> { start : U64, len : U64 }
+	first_word = |col, row, span| {
+		(start, end) = bounds(col, row)
+		ByteScan.first_word(col.data, start, end, span)
+	}
+
+	## The index (relative to the row's start) of the first `byte` in `span`.
+	find_byte : Utf8Column, U64, { start : U64, len : U64 }, U8 -> Try(U64, [NotFound])
+	find_byte = |col, row, span, byte| {
+		(start, end) = bounds(col, row)
+		ByteScan.find(col.data, start, end, span, byte)
+	}
+
+	## Append `span` of row `row` to `out`, as is or in ASCII upper or lower
+	## case: one copy, no `Str`. The span is cut to the row, and an end inside
+	## a character moves back to that character's first byte, so `out` gets
+	## whole characters, and spans that meet give the row with no loss. When
+	## the column is not valid UTF-8, the span decodes with replacement
+	## characters, as `at` does. `Writer.part_range` calls it.
+	append_span : Utf8Column, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)
+	append_span = |col, row, span, case, out| {
+		(start, end) = bounds(col, row)
+		if Utf8Column.is_valid_utf8(col) {
+			ByteScan.append(col.data, start, end, span, case, Bool.True, out)
+		} else {
+			{ s, e } = ByteScan.clamp(start, end, span)
+			fixed = Str.from_utf8_lossy(col.data.sublist({ start: s, len: e - s })).to_utf8()
+			ByteScan.append(fixed, 0, fixed.len(), { start: 0, len: fixed.len() }, case, Bool.True, out)
+		}
+	}
+}
+
+## The byte bounds of row `row` in the data buffer; an empty span past the end.
+bounds : Utf8Column, U64 -> (U64, U64)
+bounds = |col, row| {
+	start = (col.offs.get(row) ?? 0).to_u64_wrap()
+	end = (col.offs.get(row + 1) ?? 0).to_u64_wrap()
+	(start, end.max(start))
 }
 
 ## Whether every offset before `end` is at the first byte of a character:
@@ -238,4 +319,117 @@ expect {
 	split = Utf8Column.from_array(Array.from_host(host([0, 2, 4]), Utf8) ?? crash "import") ?? crash "view"
 	whole = Utf8Column.from_array(Array.from_host(host([0, 3, 4]), Utf8) ?? crash "import") ?? crash "view"
 	!split.is_valid_utf8() and split.at(0) == "a\u(FFFD)" and split.at(1) == "\u(FFFD)b" and whole.is_valid_utf8() and whole.at(0) == "aé"
+}
+
+# Byte reads of every script row, whole and at an offset, trusted and
+# checked: the byte length and bytes equal those of the row's text, under a
+# NULL row too, and nothing past the end.
+expect {
+	text = Str.join_with(script_rows, "")
+	view = |data, offset, length| Utf8Column.from_array(Array.from_host(script_host(data, offset, length), Utf8) ?? crash "import") ?? crash "view"
+	ok = |col, rows| {
+		each = rows.map_with_index(
+			|r, i| {
+				bytes = r.to_utf8()
+				col.byte_len(i) == bytes.len()
+					and bytes.map_with_index(|b, k| col.byte_at(i, k) == Ok(b)).all(|x| x)
+					and col.byte_at(i, bytes.len()) == Err(OutOfBounds)
+					and col.eq_str(i, r)
+					and col.eq_bytes(i, bytes)
+					and !col.eq_str(i, "${r}x")
+					and !col.eq_bytes(i, bytes.append(0))
+			},
+		)
+		n = rows.len()
+		each.all(|b| b) and col.byte_len(n) == 0 and col.byte_at(n, 0) == Err(OutOfBounds) and col.eq_str(n, "") and !col.eq_str(n, "a")
+	}
+	ok(view(Utf8(text), 0, 8), script_rows) and ok(view(U8s(text.to_utf8()), 0, 8), script_rows) and ok(view(Utf8(text), 2, 5), script_rows.sublist({ start: 2, len: 5 })) and ok(view(U8s(text.to_utf8()), 3, 4), script_rows.sublist({ start: 3, len: 4 }))
+}
+
+# A row that differs only in its last byte, or is a prefix, is not equal.
+expect {
+	col = Utf8Column.from_array(Array.from_strs(["été", "ét"])) ?? crash "view"
+	!col.eq_str(0, "étè") and !col.eq_str(0, "ét") and !col.eq_str(1, "été") and col.eq_str(1, "ét")
+}
+
+trim_rows : List(Str)
+trim_rows = ["  ab cd  ", "\t\n\u(B)\u(C)\r x \r", "", "   ", "\u(A0)é日\u(A0)", " 🎉 🚀", "word", "  naïve 東京 "]
+
+trim_col : Utf8Column
+trim_col = Utf8Column.from_array(Array.from_strs(trim_rows).slice(0, 8)) ?? crash "view"
+
+# The text of `span` of row `row`, through `append_span`.
+span_text : Utf8Column, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower] -> Str
+span_text = |col, row, span, case| Str.from_utf8(col.append_span(row, span, case, [])) ?? "!bad"
+
+# ASCII white space only: U+00A0 at the ends of row 4 stays.
+expect {
+	spans = (0.U64).until(8).map(|i| trim_col.trim_ascii(i)).collect()
+	spans == [{ start: 2, len: 5 }, { start: 6, len: 1 }, { start: 0, len: 0 }, { start: 3, len: 0 }, { start: 0, len: 9 }, { start: 1, len: 9 }, { start: 0, len: 4 }, { start: 2, len: 13 }]
+		and (0.U64).until(8).map(|i| span_text(trim_col, i, trim_col.trim_ascii(i), AsIs)).collect() == ["ab cd", "x", "", "", "\u(A0)é日\u(A0)", "🎉 🚀", "word", "naïve 東京"]
+		and trim_col.trim_ascii(8) == { start: 0, len: 0 }
+}
+
+expect {
+	word = |i| span_text(trim_col, i, trim_col.first_word(i, trim_col.trim_ascii(i)), AsIs)
+	(0.U64).until(8).map(word).collect() == ["ab", "x", "", "", "\u(A0)é日\u(A0)", "🎉", "word", "naïve"]
+		and trim_col.first_word(0, { start: 0, len: 2 }) == { start: 0, len: 0 }
+		and trim_col.first_word(0, { start: 50, len: 3 }) == { start: 9, len: 0 }
+}
+
+expect {
+	find = |i| trim_col.find_byte(i, { start: 0, len: 100 }, ' ')
+	(0.U64).until(9).map(find).collect() == [Ok(0), Ok(5), Err(NotFound), Ok(0), Err(NotFound), Ok(0), Err(NotFound), Ok(0), Err(NotFound)]
+		and trim_col.find_byte(0, { start: 2, len: 5 }, ' ') == Ok(4)
+		and trim_col.find_byte(0, { start: 2, len: 2 }, ' ') == Err(NotFound)
+}
+
+# ASCII case maps only ASCII letters; a span is cut to the row.
+expect {
+	all = { start: 0, len: 1000 }
+	span_text(trim_col, 7, all, AsciiUpper) == "  NAïVE 東京 "
+		and span_text(trim_col, 4, all, AsciiLower) == "\u(A0)é日\u(A0)"
+		and span_text(trim_col, 0, { start: 2, len: 2 }, AsciiUpper) == "AB"
+		and span_text(Utf8Column.from_array(Array.from_strs(["MiXeD ÉtÉ"])) ?? crash "view", 0, all, AsciiLower) == "mixed ÉtÉ"
+		and span_text(trim_col, 0, { start: 20, len: 2 }, AsIs) == ""
+		and span_text(trim_col, 9, all, AsIs) == ""
+}
+
+# A span end inside a character moves back to its first byte, so spans that
+# meet give the row back at every cut.
+expect {
+	row = "aé日🎉"
+	col = Utf8Column.from_array(Array.from_strs([row])) ?? crash "view"
+	n = row.count_utf8_bytes()
+	cuts_ok = (0.U64).until(n + 1).fold(
+		Bool.True,
+		|acc, k| {
+			out = col.append_span(0, { start: k, len: n }, AsIs, col.append_span(0, { start: 0, len: k }, AsIs, []))
+			acc and out == row.to_utf8()
+		},
+	)
+	cuts_ok and span_text(col, 0, { start: 1, len: 1 }, AsIs) == "" and span_text(col, 0, { start: 2, len: 2 }, AsIs) == "é" and span_text(col, 0, { start: 4, len: 3 }, AsIs) == "日"
+}
+
+# A column that is not valid UTF-8 appends its spans with replacement characters.
+expect {
+	host = { length: 1, null_count: 0, offset: 0, buffers: [Absent, I32s([0, 3]), U8s([0x61, 0xFF, 0x62])], children: [], dictionary: [] }
+	col = Utf8Column.from_array(Array.from_host(host, Utf8) ?? crash "import") ?? crash "view"
+	span_text(col, 0, { start: 0, len: 3 }, AsciiUpper) == "A\u(FFFD)B" and col.byte_len(0) == 3 and col.byte_at(0, 1) == Ok(0xFF)
+}
+
+# Case maps reach both ends of each ASCII letter range and leave the bytes
+# just outside them; a first word ends at any ASCII white space; a shorter
+# or longer row is not equal.
+expect {
+	col = Utf8Column.from_array(Array.from_strs(["az AZ @[`{", "ab\tcd", "ab\ncd", "abc"])) ?? crash "view"
+	all = { start: 0, len: 100 }
+	span_text(col, 0, all, AsciiUpper) == "AZ AZ @[`{"
+		and span_text(col, 0, all, AsciiLower) == "az az @[`{"
+		and col.first_word(1, all) == { start: 0, len: 2 }
+		and col.first_word(2, all) == { start: 0, len: 2 }
+		and !col.eq_bytes(3, "ab".to_utf8())
+		and !col.eq_bytes(3, "abcd".to_utf8())
+		and !col.eq_str(3, "ab")
+		and col.eq_bytes(3, "abc".to_utf8())
 }
