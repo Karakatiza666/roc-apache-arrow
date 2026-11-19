@@ -54,8 +54,9 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body, te
 		Children(List(Array)),
 	]
 
-	## Import a host array of the given type. Validates buffer kinds, sizes and
-	## offsets once. Typed host buffers are wrapped with zero copy; `U8s`
+	## Import a host array of the given type. Validates buffer kinds, sizes,
+	## offsets and views once. An `Absent` (NULL) buffer is an empty one, and
+	## an array of no rows may have an empty offsets buffer. Typed host buffers are wrapped with zero copy; `U8s`
 	## buffers for typed data are decoded (one copy). The data buffer of a
 	## binary or text type may be `Utf8(str)`: Roc takes the bytes of the `Str`
 	## with zero copy and does not check them. For Utf8 and LargeUtf8 the array
@@ -132,16 +133,12 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body, te
 			Interval(MonthDayNano) => fixed(16)
 			FixedSizeBinary(w) => fixed(w)
 			Binary | Utf8 => {
-				offs = typed_i32s(buf(1))?
 				data = typed_data(buf(2))?
-				check_offsets(offs, offset, rows, data.len(), |o| o.to_i64())?
-				Ok(Var32(offs.sublist({ start: offset, len: rows + 1 }), data))
+				Ok(Var32(row_offsets(typed_i32s(buf(1))?, offset, rows, data.len(), |o| o.to_i64(), 0)?, data))
 			}
 			LargeBinary | LargeUtf8 => {
-				offs = typed_i64s(buf(1))?
 				data = typed_data(buf(2))?
-				check_offsets(offs, offset, rows, data.len(), |o| o)?
-				Ok(Var64(offs.sublist({ start: offset, len: rows + 1 }), data))
+				Ok(Var64(row_offsets(typed_i64s(buf(1))?, offset, rows, data.len(), |o| o, 0)?, data))
 			}
 			BinaryView | Utf8View => {
 				words = typed_u32s(buf(1))?
@@ -156,16 +153,12 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body, te
 				Ok(Views(mine, datas))
 			}
 			List(f) | Map(f, _) => {
-				offs = typed_i32s(buf(1))?
 				child = kid(0, f.data_type)?
-				check_offsets(offs, offset, rows, child.len(), |o| o.to_i64())?
-				Ok(List32(offs.sublist({ start: offset, len: rows + 1 }), child))
+				Ok(List32(row_offsets(typed_i32s(buf(1))?, offset, rows, child.len(), |o| o.to_i64(), 0)?, child))
 			}
 			LargeList(f) => {
-				offs = typed_i64s(buf(1))?
 				child = kid(0, f.data_type)?
-				check_offsets(offs, offset, rows, child.len(), |o| o)?
-				Ok(List64(offs.sublist({ start: offset, len: rows + 1 }), child))
+				Ok(List64(row_offsets(typed_i64s(buf(1))?, offset, rows, child.len(), |o| o, 0)?, child))
 			}
 			FixedSizeList(f, size) => {
 				child = kid(0, f.data_type)?
@@ -393,15 +386,23 @@ prim = |xs, offset, rows, wrap|
 to_u64 : I64, Str -> Try(U64, [InvalidArray(Str)])
 to_u64 = |n, what| n.to_u64_try().map_err(|_| InvalidArray("negative ${what}"))
 
+## The checked offsets of rows `offset ..< offset + rows`. Arrow allows an
+## empty offsets buffer for an array of no rows; it reads as one offset of 0.
+row_offsets : List(a), U64, U64, U64, (a -> I64), a -> Try(List(a), [InvalidArray(Str), Unsupported(Str)])
+row_offsets = |offs, offset, rows, limit, wide, zero|
+	if rows == 0 and offs.is_empty() {
+		Ok([zero])
+	} else {
+		check_offsets(offs, offset, rows, limit, wide)?
+		Ok(offs.sublist({ start: offset, len: rows + 1 }))
+	}
+
 ## Offsets rows [offset, offset + rows] must exist, be non-negative,
 ## non-decreasing and end within `limit`. `wide` reads one offset as I64, so
 ## 32-bit offsets are checked in place, with no converted copy.
 check_offsets : List(a), U64, U64, U64, (a -> I64) -> Try({}, [InvalidArray(Str), Unsupported(Str)])
 check_offsets = |offs, offset, rows, limit, wide| {
 	if offs.len() < offset + rows + 1 {
-		if rows == 0 and offs.is_empty() {
-			return Err(InvalidArray("offsets buffer is empty"))
-		}
 		return Err(InvalidArray("offsets buffer shorter than offset + length + 1"))
 	}
 	var $prev = offs.get(offset).map_ok(wide) ?? 0
@@ -422,23 +423,47 @@ check_offsets = |offs, offset, rows, limit, wide| {
 	}
 }
 
+## Each view of 12 bytes or less has zero bytes after its value. Each longer
+## view lies in its data buffer, and its prefix is the first 4 bytes there.
 check_views : List(U32), List(List(U8)) -> Try({}, [InvalidArray(Str), Unsupported(Str)])
 check_views = |words, datas| {
 	var $i = 0
 	while $i + 3 < words.len() {
 		size = words.get($i) ?? 0
+		prefix = words.get($i + 1) ?? 0
 		if size > 12 {
 			index = words.get($i + 2) ?? 0
 			start = words.get($i + 3) ?? 0
 			match datas.get(index.to_u64()) {
-				Ok(data) if start.to_u64() + size.to_u64() <= data.len() => {}
+				Ok(data) if start.to_u64() + size.to_u64() <= data.len() =>
+					if le_u32(data, start.to_u64()) != prefix {
+						return Err(InvalidArray("view ${($i // 4).to_str()} has a prefix that is not the start of its value"))
+					}
 				_ => return Err(InvalidArray("view ${($i // 4).to_str()} points outside its data buffer"))
+			}
+		} else {
+			# The value fills the 12 bytes after the length from the low byte up.
+			padded = [prefix, words.get($i + 2) ?? 0, words.get($i + 3) ?? 0].map_with_index(|w, k| w.bitwise_and(after_value(size, k)))
+			if padded != [0, 0, 0] {
+				return Err(InvalidArray("view ${($i // 4).to_str()} has bytes after its value"))
 			}
 		}
 		$i = $i + 4
 	}
 	Ok({})
 }
+
+## The bits of inline word `k` (bytes 4k ..< 4k + 4 of the value) that lie
+## after a value of `size` bytes.
+after_value : U32, U64 -> U32
+after_value = |size, k| {
+	used = size.to_u64().minus_saturated(4 * k).min(4)
+	if (used == 4) 0 else (0xFFFFFFFF.U32).shl_wrap((8 * used).to_u8_wrap())
+}
+
+## The little-endian U32 at byte `at`; the data is known to hold it.
+le_u32 : List(U8), U64 -> U32
+le_u32 = |data, at| (0.U64).until(4).fold(0, |acc, k| acc.bitwise_or((data.get(at + k) ?? 0).to_u32().shl_wrap((8 * k).to_u8_wrap())))
 
 wrong : Str -> Try(a, [InvalidArray(Str), Unsupported(Str)])
 wrong = |want| Err(InvalidArray("expected a ${want} buffer"))
@@ -462,6 +487,7 @@ typed_i8s : Host.Buffer -> Try(List(I8), [InvalidArray(Str), Unsupported(Str)])
 typed_i8s = |b| match b {
 	I8s(xs) => Ok(xs)
 	U8s(bytes) => Ok(bytes.map(|x| x.to_i8_wrap()))
+	Absent => Ok([])
 	_ => wrong("I8s")
 }
 
@@ -485,6 +511,7 @@ typed_i16s : Host.Buffer -> Try(List(I16), [InvalidArray(Str), Unsupported(Str)]
 typed_i16s = |b| match b {
 	I16s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 2, I16.from_le_bytes))
+	Absent => Ok([])
 	_ => wrong("I16s")
 }
 
@@ -508,6 +535,7 @@ typed_u16s : Host.Buffer -> Try(List(U16), [InvalidArray(Str), Unsupported(Str)]
 typed_u16s = |b| match b {
 	U16s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 2, U16.from_le_bytes))
+	Absent => Ok([])
 	_ => wrong("U16s")
 }
 
@@ -515,6 +543,7 @@ typed_u32s : Host.Buffer -> Try(List(U32), [InvalidArray(Str), Unsupported(Str)]
 typed_u32s = |b| match b {
 	U32s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 4, U32.from_le_bytes))
+	Absent => Ok([])
 	_ => wrong("U32s")
 }
 
@@ -522,6 +551,7 @@ typed_u64s : Host.Buffer -> Try(List(U64), [InvalidArray(Str), Unsupported(Str)]
 typed_u64s = |b| match b {
 	U64s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 8, U64.from_le_bytes))
+	Absent => Ok([])
 	_ => wrong("U64s")
 }
 
@@ -529,6 +559,7 @@ typed_f32s : Host.Buffer -> Try(List(F32), [InvalidArray(Str), Unsupported(Str)]
 typed_f32s = |b| match b {
 	F32s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 4, U32.from_le_bytes).map(F32.from_bits))
+	Absent => Ok([])
 	_ => wrong("F32s")
 }
 
@@ -536,6 +567,7 @@ typed_f64s : Host.Buffer -> Try(List(F64), [InvalidArray(Str), Unsupported(Str)]
 typed_f64s = |b| match b {
 	F64s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 8, U64.from_le_bytes).map(F64.from_bits))
+	Absent => Ok([])
 	_ => wrong("F64s")
 }
 
@@ -543,6 +575,7 @@ typed_i128s : Host.Buffer -> Try(List(I128), [InvalidArray(Str), Unsupported(Str
 typed_i128s = |b| match b {
 	I128s(xs) => Ok(xs)
 	U8s(bytes) => Ok(decode_le(bytes, 16, I128.from_le_bytes))
+	Absent => Ok([])
 	_ => wrong("I128s")
 }
 
@@ -664,4 +697,21 @@ expect {
 	host = { length: 1, null_count: 0, offset: 0, buffers: [Absent, I64s([0, 2]), Utf8("hé")], children: [], dictionary: [] }
 	out = (Array.from_host(host, LargeUtf8) ?? crash "import").to_host()
 	out.buffers.get(2) == Ok(U8s("hé".to_utf8()))
+}
+
+# Arrow allows an empty offsets buffer, or none, for an array of no rows.
+expect {
+	none = |dt, offs| Array.from_host({ length: 0, null_count: 0, offset: 0, buffers: [Absent, offs, U8s([])], children: [], dictionary: [] }, dt)
+	list = |dt, offs| Array.from_host({ length: 0, null_count: 0, offset: 0, buffers: [Absent, offs], children: [Host.empty_array(0)], dictionary: [] }, dt)
+	all_ok = [none(Utf8, I32s([])), none(Binary, Absent), none(LargeUtf8, I64s([])), list(DataType.list_of(Null), I32s([])), list(LargeList(DataType.field("item", Null, Bool.True)), Absent)].all(|r| r.is_ok())
+	all_ok and none(Utf8, I32s([])).map_ok(|a| a.to_host().buffers.get(1)) == Ok(Ok(I32s([0])))
+}
+
+# An empty offsets buffer is still refused when the array has rows.
+expect Array.from_host({ length: 1, null_count: 0, offset: 0, buffers: [Absent, I32s([]), U8s([])], children: [], dictionary: [] }, Utf8).is_err()
+
+# A NULL values buffer (Absent) is an empty one: fine for no rows, refused for one.
+expect {
+	host = |rows| { length: rows, null_count: 0, offset: 0, buffers: [Absent, Absent], children: [], dictionary: [] }
+	[Int8, Int16, UInt16, UInt32, UInt64, Float32, Float64, Decimal128({ precision: 38, scale: 0 })].all(|dt| Array.from_host(host(0), dt).is_ok() and Array.from_host(host(1), dt).is_err())
 }

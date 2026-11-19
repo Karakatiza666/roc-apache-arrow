@@ -313,3 +313,18 @@ expect Array.from_host({ ..large_host, buffers: [Absent, I64s([0, 1, 3, 6, 6]), 
 expect Array.from_host({ ..binary_host, buffers: [Absent, I64s([0, 1, 3, 6, 6, 19]), var_data] }, Binary).is_err()
 expect Array.from_host({ ..fixed_host, buffers: [Absent, U8s("..abxyc".to_utf8())] }, FixedSizeBinary(2)).is_err()
 expect Array.from_host({ ..view_host, length: 5 }, BinaryView).is_err()
+
+# A long view whose prefix is not the start of its value is refused.
+expect {
+	long = "a string over twelve".to_utf8()
+	host = |prefix| { length: 1, null_count: 0, offset: 0, buffers: [Absent, U32s([long.len().to_u32_wrap(), prefix, 0, 0]), U8s(long), I64s([long.len().to_i64_wrap()])], children: [], dictionary: [] }
+	Array.from_host(host(0x74732061), Utf8View).is_ok() and Array.from_host(host(0x74732062), Utf8View).is_err()
+}
+
+# An inline view with a byte after its value is refused; zero padding is fine.
+expect {
+	host = |words| { length: 1, null_count: 0, offset: 0, buffers: [Absent, U32s(words), I64s([])], children: [], dictionary: [] }
+	ok = [[3, 0x00636261, 0, 0], [12, 1, 2, 3], [0, 0, 0, 0], [4, 0x64636261, 0, 0]].all(|w| Array.from_host(host(w), BinaryView).is_ok())
+	bad = [[3, 0x01636261, 0, 0], [0, 0, 0, 0x100], [4, 0x64636261, 1, 0], [11, 0, 0, 0xFF000000]].all(|w| Array.from_host(host(w), BinaryView).is_err())
+	ok and bad
+}
