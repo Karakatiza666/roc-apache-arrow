@@ -112,3 +112,34 @@ jobs:
           ROC: ${{ steps.roc.outputs.path }}
           ROC_OPT: ${{ matrix.opt }}
         run: scripts/test-host.sh
+
+  # Differential tests against arrow-rs through the C Data Interface
+  # (tests/contender). The test platform builds for Linux glibc on x64 and
+  # arm64.
+  test-contender:
+    name: Differential vs arrow-rs (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install Roc
+        id: roc
+        env:
+          NIGHTLY: ${{ inputs.roc-nightly }}
+        run: echo "path=$(scripts/install-roc.sh $NIGHTLY)" >> "$GITHUB_OUTPUT"
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            tests/contender/target
+          key: contender-${{ matrix.os }}-${{ hashFiles('tests/contender/Cargo.lock') }}
+      - name: Run the differential tests
+        env:
+          ROC: ${{ steps.roc.outputs.path }}
+        run: scripts/test-contender.sh
