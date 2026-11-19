@@ -7,27 +7,36 @@ Interface, runs the whole job, and exports the result, as a host does.
 
 | Item | Where |
 |---|---|
-| table and job, Roc and arrow-rs | [tests/contender/src/lineitem.rs](tests/contender/src/lineitem.rs), entry point `lineitem` in [tests/contender/app.roc](tests/contender/app.roc) |
+| table and job, Roc and arrow-rs | [tests/contender/src/lineitem.rs](tests/contender/src/lineitem.rs), entry points `lineitem` and `lineitem_str` in [tests/contender/app.roc](tests/contender/app.roc) |
 | bench driver and sampling profiler | [tests/contender/src/bin/bench_lineitem.rs](tests/contender/src/bin/bench_lineitem.rs) |
 | run it | `scripts/bench-contender.sh` (report in `tests/contender/target/bench-lineitem.md`); `bench.yml` in CI, by hand only |
 | same output on both sides | `tests/contender/tests/lineitem.rs` in `scripts/test-contender.sh`, and a check of every batch before each timed run |
 
 ## Summary
 
-On one pinned core, the Roc job takes 2.2 times the time of the arrow-rs row
-loop with trusted text, and 2.5 times with checked text (1M rows, batches of
-8192); 2.2 to 2.7 times over all runs, 1M and 6M rows, both batch sizes.
-About 80% of the gap is the per-row text change and the export; the numeric
-work is 1.7 times arrow-rs, and the import with trusted text costs about
-3 ms more per 1M rows.
+On one pinned core, the Roc job takes 1.07 times the time of the arrow-rs
+row loop with trusted text (1M rows, batches of 8192), and 1.06 times at
+batches of 65536. With checked text it takes 1.4 times: the extra is the
+UTF-8 check at import. The same job written with a `Str` per text read and
+write (`lineitem_str`, the style of the first bench) takes 2.0 to 2.2 times.
 
-| Phase (1M rows, batch 8192) | arrow-rs rows ms | Roc, trusted text ms | Roc / arrow-rs | Main cause in Roc |
-|---|---:|---:|---:|---|
-| host | 0.0 | 1.8 | | the test host makes its `Host` values per batch |
-| import | 2.3 | 5.0 | 2.2x | `Array.from_host` checks every buffer; arrow-rs `from_ffi` does not |
-| numeric | 15.5 | 25.6 | 1.7x | checked `I128` multiply as a call; a `Str` slice per 1-character flag |
-| text and export | 39.2 | 91.1 | 2.3x | eight out-of-line `Str` builtins per row, two copies of the text, refcounts |
-| whole job | 57.0 | 123.5 | 2.2x | |
+The byte reads of `Utf8Column` and the writer's parts closed the text gap:
+the text change and the export now take less time in Roc than in arrow-rs.
+What is left is in the numeric work and the import.
+
+| Phase (1M rows, batch 8192, trusted text) | arrow-rs rows ms | Roc before ms | Roc now ms | Roc now / arrow-rs | What changed |
+|---|---:|---:|---:|---:|---|
+| host | 0.0 | 1.8 | 2.1 | | nothing (the test host makes its `Host` values per batch) |
+| import | 2.6 | 5.0 | 5.1 | 2.0x | nothing (`Array.from_host` checks every buffer) |
+| numeric | 19.4 | 25.6 | 24.8 | 1.3x | flags read with `byte_len` and `byte_at`: no `Str` slice and no reference count per flag |
+| text and export | 41.6 | 91.1 | 35.8 | 0.86x | `trim_ascii`, `find_byte`, then `part_upper` and `part_range` into the writer: each byte copied once, no `Str` |
+| whole job | 63.7 | 123.5 | 67.8 | 1.07x | |
+
+"Roc before" is the first run of this bench (0.0.2 before the byte reads and
+the parts, [below](#before-the-byte-reads-and-the-parts)); "arrow-rs rows"
+and "Roc now" are from the same run. That run of arrow-rs took 57.0 ms: the
+machine load was the same (1-minute load average 5.5 and 5.4), but compare
+ratios, not absolute times.
 
 ## Method
 
@@ -64,10 +73,23 @@ The same job on each side, per batch, written the usual way for each:
 | import | the host wraps the C buffers as Roc lists (no copy); `Array.from_host`, `StructColumn`, `PrimitiveColumn`, `Utf8Column` | `to_ffi`, `from_ffi`, `make_array` | the same |
 | filter: 1994-01-01 <= shipdate < 1997-03-01 (51% of rows) | `if` in the row loop | `continue` in the row loop | `gt_eq`, `lt`, `and`, then one `FilterBuilder` for 8 columns |
 | disc_price = extendedprice * (1 - discount), Decimal128(38, 4); charge = disc_price * (1 + tax), Decimal128(38, 6) | `I128` arithmetic | `i128` arithmetic | `sub`, `mul`, `add` kernels |
-| comment_norm: trim, first word in ASCII uppercase; comment_len in bytes | `trim`, `split_first`, `with_ascii_uppercased`, interpolation, `Writer.str_push` | `trim`, `split_once`, `to_ascii_uppercase` into one reused `String`, `StringBuilder` | the same loop (arrow-rs has no kernel for it); `length` kernel |
-| totals per (returnflag, linestatus): count, sums of quantity, extendedprice, disc_price, charge | a list of 6 records, `List.update` | an array of 6 structs | the same loop over the value slices |
+| comment_norm: trim, first word in ASCII uppercase; comment_len in bytes | `trim_ascii`, `find_byte` of the first space, then `Writer.str_begin`, `part_upper` of the first word, `part_range` of the rest, `part_len`, `str_end` | `trim`, `split_once`, `to_ascii_uppercase` into one reused `String`, `StringBuilder` | the same loop (arrow-rs has no kernel for it); `length` kernel |
+| totals per (returnflag, linestatus): count, sums of quantity, extendedprice, disc_price, charge | the group from `byte_len` and `byte_at` of each flag; a list of 6 records, `List.update` | an array of 6 structs | the same loop over the value slices |
 | export: one Struct row of `rows` (List of Struct) and `groups` (List of Struct) | `Writer`, then the host exports the Roc lists with no copy | builders, `StructArray`, `ListArray`; `to_ffi` | the same |
 | the consumer imports the result | `from_ffi`, no `validate_full` | `from_ffi`, no `validate_full` | the same |
+
+`lineitem_str` is the same job with a `Str` per text read and write: the
+flags as `Utf8Column.at` slices, and comment_norm with `trim`, `split_first`,
+`with_ascii_uppercased`, interpolation and `Writer.str_push`.
+
+arrow-rs `trim` removes Unicode white space, and `trim_ascii` only ASCII
+white space. Each Unicode white space character outside ASCII starts with
+0xC2, 0xE1, 0xE2 or 0xE3, so `lineitem` gives a comment whose trimmed span
+starts with one of those bytes, or has one 2 or 3 bytes before its end, to
+the `Str` path; the other comments trim the same. The bench data holds none
+of them (0.4% of its comments go to the `Str` path for other characters,
+for example a final "✅"); `tests/contender/tests/lineitem.rs` checks comments
+with Unicode white space at the ends.
 
 Before it times, each run checks its output against `by_rows` on every
 batch with arrow-rs logical equality, and checks it with `validate_full`.
@@ -100,13 +122,55 @@ example, a Roc `normalize` with no `trim`).
 ## Results
 
 AMD Ryzen AI 9 HX 370 (x86-64), Linux, Roc nightly-2026-11-15-f25da45, rustc
-1.99.0. The machine is shared: the 1-minute load average was 4 to 6 during both
-runs (24 CPUs; it was higher earlier, see the 5- and 15-minute values in
-the script's report), and each process was pinned to one
-CPU. Under heavy load the same runs took up to 2.5 times longer on both
-sides; compare the min column, and compare ratios, not absolute times.
+1.99.0. The machine is shared: the 1-minute load average was 3.5 to 5.5
+during the runs (24 CPUs), and each process was pinned to one CPU. Under
+heavy load the same runs took up to 2.5 times longer on both sides; compare
+the min column, and compare ratios, not absolute times.
 
 ### 1M rows
+
+Whole job, time per pass over all rows (9 timed passes). "Roc" is
+`lineitem`, "Roc Str" is `lineitem_str`:
+
+| Way | Batch rows | Median ms | Min ms | Max ms | Mrows/s | Input MB/s | Time vs arrow-rs rows | Peak RSS MiB | RSS growth MiB | Allocations per row |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| arrow-rs rows | 8192 | 63.7 | 63.4 | 83.0 | 15.71 | 2616 | 1.00x | 169 | 0.5 | 0.59 |
+| arrow-rs kernels | 8192 | 78.7 | 78.6 | 81.0 | 12.70 | 2115 | 1.24x | 170 | 0.1 | 0.59 |
+| Roc, checked text | 8192 | 90.2 | 90.0 | 90.9 | 11.09 | 1846 | 1.42x | 169 | 0.0 | 0.12 |
+| Roc, trusted text | 8192 | 67.8 | 67.1 | 68.4 | 14.74 | 2455 | 1.07x | 169 | 0.0 | 0.12 |
+| Roc Str, checked text | 8192 | 152.5 | 151.8 | 153.3 | 6.56 | 1092 | 2.40x | 169 | 0.0 | 0.38 |
+| Roc Str, trusted text | 8192 | 129.5 | 129.1 | 132.1 | 7.72 | 1286 | 2.03x | 169 | 0.0 | 0.38 |
+| arrow-rs rows | 65536 | 53.9 | 53.8 | 55.2 | 18.54 | 3088 | 1.00x | 171 | 0.0 | 0.50 |
+| arrow-rs kernels | 65536 | 65.5 | 65.3 | 65.6 | 15.26 | 2542 | 1.21x | 176 | 0.1 | 0.50 |
+| Roc, checked text | 65536 | 75.7 | 75.3 | 76.3 | 13.22 | 2201 | 1.40x | 172 | 0.0 | 0.02 |
+| Roc, trusted text | 65536 | 57.4 | 56.7 | 57.7 | 17.41 | 2900 | 1.06x | 171 | 0.0 | 0.02 |
+| Roc Str, checked text | 65536 | 136.3 | 135.6 | 136.7 | 7.34 | 1222 | 2.53x | 172 | 0.0 | 0.28 |
+| Roc Str, trusted text | 65536 | 117.1 | 116.9 | 118.1 | 8.54 | 1422 | 2.17x | 171 | 0.0 | 0.28 |
+
+Phases, median ms per pass:
+
+| Way | Batch rows | host | import | numeric | text and export | full |
+|---|---:|---:|---:|---:|---:|---:|
+| arrow-rs rows | 8192 | 0.0 | 2.6 | 19.4 | 41.6 | 63.7 |
+| Roc, checked text | 8192 | 2.1 | 24.5 | 26.6 | 36.9 | 90.2 |
+| Roc, trusted text | 8192 | 2.1 | 5.1 | 24.8 | 35.8 | 67.8 |
+| Roc Str, trusted text | 8192 | 2.2 | 5.1 | 29.6 | 92.6 | 129.5 |
+| arrow-rs rows | 65536 | 0.0 | 0.3 | 16.3 | 37.3 | 53.9 |
+| Roc, checked text | 65536 | 0.2 | 21.4 | 22.6 | 31.4 | 75.7 |
+| Roc, trusted text | 65536 | 0.2 | 3.3 | 22.9 | 31.0 | 57.4 |
+| Roc Str, trusted text | 65536 | 0.2 | 3.3 | 28.3 | 85.3 | 117.1 |
+
+Roc makes 0.12 heap allocations per input row at batch 8192 (0.02 at
+65536), against 0.59 (0.50) for arrow-rs and 0.38 (0.28) for the `Str`
+style: a row written in parts allocates nothing.
+
+### Before the byte reads and the parts
+
+The first run of this bench, before `Utf8Column` had the byte reads and
+`Writer` had the parts: the Roc job was the `Str` style that `lineitem_str`
+keeps. The 1-minute load average was 4 to 6.
+
+#### 1M rows
 
 Whole job, time per pass over all rows (9 timed passes):
 
@@ -132,7 +196,7 @@ Phases, median ms per pass:
 | Roc, checked text | 65536 | 0.2 | 20.5 | 26.2 | 87.5 | 134.4 |
 | Roc, trusted text | 65536 | 0.2 | 3.1 | 25.6 | 98.5 | 127.5 |
 
-### 6M rows
+#### 6M rows
 
 Whole job (7 timed passes):
 
@@ -158,7 +222,74 @@ Phases, median ms per pass:
 | Roc, checked text | 65536 | 1.3 | 121.4 | 176.7 | 524.5 | 823.8 |
 | Roc, trusted text | 65536 | 1.6 | 18.4 | 162.6 | 543.7 | 726.4 |
 
-## Why Roc is slower
+## What is left
+
+The profile of the whole Roc job (trusted text, batch 8192;
+`BENCH_PROFILE=1`, the default of the script). The `roc__p...` names are
+Roc procedures, named by a hash: the phase runs put `pb0385...` in the
+import (50% of the import samples) and `p6112...` and `p844d...` in the row
+loop (59% of the numeric samples).
+
+```
+samples	1164
+ 37.8%	roc__p7f5494624c23d5d439e4b41c3bd28c96.fast
+ 25.0%	roc__p6112f2e3e33114e8af5eccb75f8ffe28.fast
+  7.9%	roc__p844da0cc989cbc6d0546e6df8a80a405.fast
+  6.4%	roc__pb0385ac3fa8f4c20b3a2ddc16eb05a58.fast
+  5.6%	dev_wrappers.roc_builtins_num_mul_with_overflow_i128
+  4.8%	(shared libraries: libc malloc, free, memcpy)
+  3.4%	memcpy
+  0.7%	__rustc::__rust_alloc
+  0.5%	roc_llvm_rc_decref_185
+  0.4%	roc_llvm_rc_incref_185
+  0.3%	roc_llvm_rc_decref_84
+  0.3%	roc_llvm_rc_decref_27
+  0.3%	roc_cold_shim.roc_builtins_list_reserve_for_append
+  0.3%	roc__p7f519a79a5d47000557d05972726fb84.fast
+  0.3%	__rustc::__rust_no_alloc_shim_is_unstable_v2
+  0.3%	<arrow_array::ffi::ImportedArrowArray>::consume
+  0.3%	<arrow_array::array::byte_array::GenericByteArray<arrow_array::types::GenericStringType<i32>> as arrow_array::
+  0.2%	roc_llvm_rc_incref_59
+  0.2%	roc__p95d52a98025dafa3d9a7804e77c169f2.fast
+  0.2%	list.listReserveForAppend
+```
+
+No `Str` builtin is left in the profile (before: about 40% of the samples
+in `roc_builtins_str_*` and their helpers), and the reference counts fell
+from 8% to under 2%. The Roc numeric phase alone:
+
+```
+samples	536
+ 42.4%	roc__p6112f2e3e33114e8af5eccb75f8ffe28.fast
+ 16.8%	roc__p844da0cc989cbc6d0546e6df8a80a405.fast
+ 14.4%	roc__pb0385ac3fa8f4c20b3a2ddc16eb05a58.fast
+ 12.1%	dev_wrappers.roc_builtins_num_mul_with_overflow_i128
+  4.5%	(shared libraries: libc malloc, free, memcpy)
+  0.9%	roc_llvm_rc_incref_185
+  0.9%	roc_llvm_rc_decref_84
+  0.7%	__rustc::__rust_alloc
+  0.6%	roc_llvm_rc_decref_93
+  0.6%	roc_llvm_rc_decref_185
+```
+
+The rest of the gap, 4.1 ms per 1M rows at batch 8192 and 3.5 ms at 65536:
+
+| Cost | Evidence | Size | Owner |
+|---|---|---|---|
+| `I128` multiply with an overflow check is a call to `num_mul_with_overflow_i128`, not inline; arrow-rs `i128 *` wraps and is inline | 12% of the numeric phase, 5.6% of the job | about 3 ms | compiler: the builtin is not inlined. The bench keeps the usual check of each side, so the app does not use `times_wrap` |
+| `Array.from_host` checks the offsets, lengths and buffer sizes of every column; `from_ffi` checks nothing | import phase 5.1 ms against 2.6 ms at batch 8192 (3.3 against 0.3 at 65536) | 2.5 to 3 ms | package, by design: the checks are what make the views safe |
+| the test host makes its `Host` values from the C structs for each batch | host phase 2.1 ms at batch 8192, 0.2 ms at 65536 | a cost per batch | test host; a real host does the same |
+| row loop: the views' `at` and `is_valid`, the `Writer` pushes, `List.update` of the totals | `p6112...`, `p844d...` | numeric work 1.3 times arrow-rs | compiler code generation; no builtin call or reference count is left in it |
+
+The text change and the export are now 14% faster than in arrow-rs: the
+ASCII trim and the first-space search are byte loops that LLVM inlines,
+and each byte goes once from the column's buffer to the writer's, where
+arrow-rs `normalize` decodes code points for `trim` and copies the
+uppercase first word through a temporary `String`.
+
+## Why the Str style is slower
+
+This is the analysis of the first run. It holds for `lineitem_str` today.
 
 ### Text: 2.3 times arrow-rs, about 80% of the gap
 
@@ -227,10 +358,8 @@ Roc makes fewer heap allocations than arrow-rs (0.38 against 0.59 per row,
 since a `Str` of 23 bytes or less is not on the heap), so the gap is not
 the allocator: it is calls, copies and reference counts per row.
 
-What would close it: a `Writer` push that takes a text in parts (the upper
-first word and the rest) with no `Str` in between, and a trim of ASCII white
-space only, would remove two copies and three builtin calls per row. The
-package does not have them in 0.0.2.
+The writer's parts (`part_upper`, `part_range`) and `trim_ascii` remove
+these copies and builtin calls; see [What is left](#what-is-left).
 
 ### Numeric work: 1.7 times arrow-rs
 

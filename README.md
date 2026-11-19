@@ -18,13 +18,13 @@ an application.
 | Item | Value |
 |---|---|
 | Systems | Linux (x64, arm64) and macOS; Windows is not tested |
-| Tests | 279 `expect`s, 3 examples, a C host test under AddressSanitizer, differential tests against arrow-rs |
+| Tests | 297 `expect`s, 3 examples, 7 misuse files that must not type check, a C host test under AddressSanitizer, differential tests against arrow-rs |
 
 ## Use it
 
 ```roc
 app [main!] {
-    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.2/4ZaS9d8uUZi4wJSBC1zrwsGD8ncrfV1yzS1Ry7vtjPs8.tar.zst",
+    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.2/DNWXauUhBT2dkoJHFDfo1iJjgZAT4aKDbLv4kM2y9Ms3.tar.zst",
 }
 
 import arrow.Array
@@ -89,6 +89,27 @@ A host that promises valid UTF-8 can pass the text buffer as a `Str`
 | `MapColumn` | Map | `keys`, `items`, `range(i)` |
 | `Items(item, src)` | one list value, read on demand | `get(j)`, `iter()` |
 
+`Utf8Column` and `BinaryColumn` also read a row's bytes in place, with no
+`Str`, no slice and no reference count per row. Spans are relative to the
+row's start.
+
+| Read | Gives |
+|---|---|
+| `byte_len(i)`, `byte_at(i, k)` | the byte length of a row, one byte of it |
+| `eq_str(i, s)`, `eq_bytes(i, xs)` | whether a row holds exactly `s` or `xs` |
+| `trim_ascii(i)` | the span of the row with ASCII white space trimmed at both ends (space, tab, line feed, vertical tab, form feed, carriage return; not other Unicode white space) |
+| `first_word(i, span)`, `find_byte(i, span, b)` | the span before the first ASCII white space; the index of the first byte `b` |
+| `append_span(i, span, case, out)` | the span's bytes appended to a list, as is or in ASCII upper or lower case |
+
+```roc
+# A 1-byte flag, with no Str per row.
+group = match (flag.byte_len(i), flag.byte_at(i, 0)) {
+    (1, Ok('A')) => 0
+    (1, Ok('R')) => 1
+    _ => 2
+}
+```
+
 `Items` holds a source type, not a closure, because this compiler boxes a
 closure inside a `Try`, a tuple or a record (one allocation per value).
 
@@ -109,10 +130,10 @@ out = Writer.prim_finish($w, [], |xs| I64s(xs))     # a Host.Array
 |---|---|---|
 | `prim` | every fixed-width type | `prim_push` |
 | `bools` | Boolean | `bools_push` |
-| `varlen` | Utf8, Binary (`I32` offsets) | `str_push`, `bytes_push` |
-| `large_varlen` | LargeUtf8, LargeBinary (`I64` offsets) | `large_str_push`, `large_bytes_push` |
+| `varlen` | Utf8, Binary (`I32` offsets) | `str_push`, `bytes_push`; in parts: `str_begin` .. `str_end` |
+| `large_varlen` | LargeUtf8, LargeBinary (`I64` offsets) | `large_str_push`, `large_bytes_push`; in parts: `large_str_begin` .. `large_str_end` |
 | `fixed` | FixedSizeBinary | `fixed_push` |
-| `views` | BinaryView, Utf8View | `views_push`, `views_str_push` |
+| `views` | BinaryView, Utf8View | `views_push`, `views_str_push`; in parts: `views_str_begin` .. `views_str_end` |
 | `lists` | List, Map (with a child writer) | `list_push` |
 | `large_lists` | LargeList (with a child writer) | `large_list_push` |
 | `fixed_lists` | FixedSizeList (with a child writer) | `fixed_list_push` |
@@ -121,6 +142,39 @@ out = Writer.prim_finish($w, [], |xs| I64s(xs))     # a Host.Array
 NULL rows go to a sparse list, so a column with no NULL gets no bitmap. The
 `cleared` argument of each `*_finish` makes more rows NULL (for example, rows
 that failed).
+
+A text or binary row can be written in parts, with no `Str` between: each
+part goes straight into the data buffer. `str_begin` (or `large_str_begin`,
+`views_str_begin`) opens a row, the `part_*` functions append to it, and the
+matching `*_end` closes it.
+
+```roc
+# The trimmed comment with its first word in ASCII uppercase: each byte is
+# copied once, from the column's buffer into the writer's.
+trim = comment.trim_ascii(i)
+word = comment.first_word(i, trim)
+rest = { start: word.start + word.len, len: trim.len - word.len }
+row = Writer.str_begin($w) |> Writer.part_upper(comment, i, word) |> Writer.part_range(comment, i, rest)
+len = Writer.part_len(row)
+$w = Writer.str_end(row)
+```
+
+| Part | Appends |
+|---|---|
+| `part_str(t, s)` | a `Str` |
+| `part_bytes(t, xs)` | bytes, as they are |
+| `part_range(t, col, i, span)` | a span of row `i` of a `Utf8Column` or `BinaryColumn`, with no slice |
+| `part_upper`, `part_lower` | the same, with ASCII letters in upper or lower case |
+| `part_len(t)` | (no append) the bytes of the open row so far |
+
+An open row (`Writer.Text(w)`) is not a writer, so the misuses are type
+errors, not bad data: a part with no open row, a push, a NULL or a finish
+while a row is open, a second end, or an end of another writer's row.
+[tests/misuse](tests/misuse) holds one file per misuse, and
+`scripts/test.sh` checks that each fails to type check. A span is cut to the
+row, and in a text column an end of a span inside a character moves back to
+that character's first byte, so a part is whole characters and spans that
+meet give the row back.
 
 ## Dynamic API
 
@@ -256,7 +310,9 @@ arrow-rs array ◀──from_ffi + validate_full── C ArrowArray ◀── Ho
 | `identity` | the array read through the views (`PrimitiveColumn`, `BoolColumn`, `BinaryColumn`, `Utf8Column`, `ListColumn`, `StructColumn`, `MapColumn`) and written again with `Writer` |
 | `digest` | a Utf8 column: one text per row, read with the checked reads and `Items` |
 | `validate` | one row: `accept`, or `refuse` and the error of `from_host` or of a view |
-| `lineitem` | a batch job over a table modeled on TPC-H lineitem: filter, Decimal128 prices, a text change, totals per group; see [PERFORMANCE.md](PERFORMANCE.md) |
+| `lineitem` | a batch job over a table modeled on TPC-H lineitem: filter, Decimal128 prices, a text change, totals per group, with the byte reads and the writer's parts; see [PERFORMANCE.md](PERFORMANCE.md) |
+| `lineitem_str` | the same job with a `Str` per text read and per text written |
+| `parts` | a text or binary column, each row read with the byte reads and written again in parts, into a Struct of one field per read and write (`parts_bin` reads Utf8 through `BinaryColumn`) |
 
 To add an entry point, add a branch to the `match` of `run` in `app.roc`,
 then run it from Rust:
@@ -277,7 +333,8 @@ value back to Roc when it is dropped.
 | valid, matrix | every leaf type, alone and in List, LargeList, FixedSizeList and Struct, with no, some and all NULLs, at 0, 1 and 37 rows | the same |
 | invalid | `2 × CONTENDER_CASES` arrays, each with every mutation that fits it | Roc's `validate` agrees with arrow-rs's `validate_full`, or the difference is in the list below |
 | edges | `null_count` -1; NULL buffers for an array of no rows | the same digest; accept |
-| lineitem | 20000 rows of the bench table, in batches of 8192 and of 7 rows | `lineitem` gives the output of an arrow-rs row loop and of arrow-rs kernels, with checked and trusted text |
+| lineitem | 20000 rows of the bench table, in batches of 8192 and of 7 rows; comments with Unicode and ASCII white space at the ends | `lineitem` and `lineitem_str` give the output of an arrow-rs row loop and of arrow-rs kernels, with checked and trusted text |
+| parts | `CONTENDER_CASES` columns of Utf8, LargeUtf8, Utf8View, Binary, LargeBinary and BinaryView, cut at an offset, with NULLs; text of ASCII of both cases, every ASCII white space byte, Unicode white space, Latin, CJK and emoji; each piece alone in each type | `parts` and `parts_bin` give what the same reads and writes give in arrow-rs |
 
 Each case runs with three feeds: typed lists, every buffer as `U8s` (Roc
 copies it), and the text of Utf8 and LargeUtf8 as a trusted `Utf8` `Str`.
@@ -359,6 +416,11 @@ are not in it.
 | `Array.from_host` | takes an empty offsets buffer, and `Absent` (NULL) buffers, for an array of no rows, as arrow-rs does |
 | `Array.from_host` | refuses a view whose prefix is not the start of its value, or an inline view with bytes after its value, as arrow-rs does |
 | `Utf8Column.is_valid_utf8` | false when an offset of a `U8s` text is inside a character; each row then decodes its own bytes |
+| `Utf8Column`, `BinaryColumn`: `byte_len`, `byte_at`, `eq_str`, `eq_bytes` | new: read a row's bytes in place, with no `Str`, slice or reference count per row |
+| `Utf8Column`, `BinaryColumn`: `trim_ascii`, `first_word`, `find_byte` | new: spans of a row: ASCII white space trimmed (only ASCII white space counts), the first word, the first given byte |
+| `Utf8Column`, `BinaryColumn`: `append_span` | new: append a span of a row to a byte list, as is or in ASCII upper or lower case |
+| `Writer.Text(w)`, `str_begin`, `str_end`, `large_str_begin`, `large_str_end`, `views_str_begin`, `views_str_end` | new: write a text or binary row in parts; misuse is a type error |
+| `Writer.part_str`, `part_bytes`, `part_range`, `part_upper`, `part_lower`, `part_len` | new: the parts of an open row; a span of a column row goes in with one copy |
 
 A 0.0.1 host works with no change: tags 0 .. 11 keep their numbers, and no
 export of the package holds a `Utf8` buffer. Rebuild it against the new

@@ -198,6 +198,14 @@ fails at least one `expect` when it is stubbed.
 | `get_bytes` | `BinaryColumn, U64 -> Try(List(U8), [Null, OutOfBounds])` | checked read | tested |
 | `get_str` | `BinaryColumn, U64 -> Try(Str, [Null, OutOfBounds, BadUtf8])` | checked read; checks UTF-8 per call | tested |
 | `iter_bytes` | `BinaryColumn -> Iter(Try(List(U8), [Null]))` | rows in order | tested |
+| `byte_len` | `BinaryColumn, U64 -> U64` | a row's byte length, NULL or not; no `Str` | tested |
+| `byte_at` | `BinaryColumn, U64, U64 -> Try(U8, [OutOfBounds])` | one byte of a row; no `Str` | tested |
+| `eq_str` | `BinaryColumn, U64, Str -> Bool` | the row holds exactly the text; no `Str` per row | tested |
+| `eq_bytes` | `BinaryColumn, U64, List(U8) -> Bool` | the row holds exactly the bytes | tested |
+| `trim_ascii` | `BinaryColumn, U64 -> { start : U64, len : U64 }` | the row's span with ASCII white space trimmed at both ends; other Unicode white space stays | tested |
+| `first_word` | `BinaryColumn, U64, { start : U64, len : U64 } -> { start : U64, len : U64 }` | the part of a span before its first ASCII white space | tested |
+| `find_byte` | `BinaryColumn, U64, { start : U64, len : U64 }, U8 -> Try(U64, [NotFound])` | the first index of a byte in a span | tested |
+| `append_span` | `BinaryColumn, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)` | append a span of a row, as is or in ASCII case; an end inside a character moves back to its first byte | tested |
 
 ## Utf8Column
 
@@ -210,6 +218,14 @@ fails at least one `expect` when it is stubbed.
 | `is_valid_utf8` | `Utf8Column -> Bool` | the text passed the check, or is trusted | tested |
 | `get` | `Utf8Column, U64 -> Try(Str, [Null, OutOfBounds])` | checked read | tested |
 | `at` | `Utf8Column, U64 -> Str` | loop read, a slice | tested |
+| `byte_len` | `Utf8Column, U64 -> U64` | a row's byte length, NULL or not; no `Str` | tested |
+| `byte_at` | `Utf8Column, U64, U64 -> Try(U8, [OutOfBounds])` | one byte of a row; no `Str` | tested |
+| `eq_str` | `Utf8Column, U64, Str -> Bool` | the row holds exactly the text; no `Str` per row | tested |
+| `eq_bytes` | `Utf8Column, U64, List(U8) -> Bool` | the row holds exactly the bytes | tested |
+| `trim_ascii` | `Utf8Column, U64 -> { start : U64, len : U64 }` | the row's span with ASCII white space trimmed at both ends; other Unicode white space stays | tested |
+| `first_word` | `Utf8Column, U64, { start : U64, len : U64 } -> { start : U64, len : U64 }` | the part of a span before its first ASCII white space | tested |
+| `find_byte` | `Utf8Column, U64, { start : U64, len : U64 }, U8 -> Try(U64, [NotFound])` | the first index of a byte in a span | tested |
+| `append_span` | `Utf8Column, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)` | append a span of a row, as is or in ASCII case; an end inside a character moves back to its first byte | tested |
 | LargeUtf8, Utf8View text views | | read them with `BinaryColumn.get_str` | not in 0.0.2 |
 
 ## ListColumn
@@ -288,6 +304,23 @@ takes `cleared : List(U64)`, more rows to make NULL, and gives a
 | LargeList | `large_lists : w -> LargeLists(w)` | `large_list_push : LargeLists(w), List(a), (w, a -> w) -> LargeLists(w)` | `large_list_null : LargeLists(w) -> LargeLists(w)` | `large_list_finish : LargeLists(w), List(U64), (w -> Host.Array) -> Host.Array` | tested |
 | FixedSizeList | `fixed_lists : U64, w -> FixedLists(w)` | `fixed_list_push : FixedLists(w), List(a), (w, a -> w), (w -> w) -> FixedLists(w)` | `fixed_list_null : FixedLists(w), (w -> w) -> FixedLists(w)` | `fixed_list_finish : FixedLists(w), List(U64), (w -> Host.Array) -> Host.Array` | tested |
 | Struct | `row : U64 -> Row` | `row_push : Row -> Row` | `row_null : Row -> Row` | `row_finish : Row, List(U64), List(Host.Array) -> Host.Array` | tested |
+
+A text or binary row in parts: `Text(w) : { open : w, data : List(U8), start : U64 }`
+is one open row, and `VarOpen`, `LargeVarOpen`, `ViewsOpen` are the rest of
+the writer while it is open. An open row is not a writer, so a part outside
+a row, a push, NULL or finish inside one, and a second end are type errors
+(`tests/misuse`, run by `scripts/test.sh`).
+
+| Item | Signature | Purpose | Status |
+|---|---|---|---|
+| `str_begin`, `str_end` | `Var -> Text(VarOpen)`, `Text(VarOpen) -> Var` | open and close a Utf8 or Binary row | tested |
+| `large_str_begin`, `large_str_end` | `LargeVar -> Text(LargeVarOpen)`, `Text(LargeVarOpen) -> LargeVar` | open and close a LargeUtf8 or LargeBinary row | tested |
+| `views_str_begin`, `views_str_end` | `Views -> Text(ViewsOpen)`, `Text(ViewsOpen) -> Views` | open and close a Utf8View or BinaryView row; 12 bytes or less go inline at the end | tested |
+| `part_str` | `Text(w), Str -> Text(w)` | append a string | tested |
+| `part_bytes` | `Text(w), List(U8) -> Text(w)` | append bytes as they are | tested |
+| `part_range` | `Text(w), c, U64, { start : U64, len : U64 } -> Text(w) where [c.append_span : c, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)]` | append a span of a column row (`Utf8Column`, `BinaryColumn`) with one copy | tested |
+| `part_upper`, `part_lower` | as `part_range` | the same, with ASCII letters in upper or lower case | tested |
+| `part_len` | `Text(w) -> U64` | the bytes of the open row so far | tested |
 
 ## Builder
 
