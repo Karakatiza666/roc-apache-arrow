@@ -246,6 +246,7 @@ pub fn static_rc_intact() -> bool {
 
 thread_local! {
     static LIVE_BLOCKS: Cell<i64> = const { Cell::new(0) };
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     static CASE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
@@ -254,21 +255,39 @@ pub fn live_blocks() -> i64 {
     LIVE_BLOCKS.with(|n| n.get())
 }
 
+/// The blocks Roc allocated on this thread so far, a realloc counted as one.
+pub fn allocations() -> u64 {
+    ALLOCATIONS.with(|n| n.get())
+}
+
 /// Name the case this thread runs, for the message of a Roc crash.
 pub fn set_case(description: &str) {
     CASE.with(|c| *c.borrow_mut() = description.to_string());
 }
 
+/// glibc's `malloc` gives 16-byte aligned blocks; a wider alignment takes
+/// `posix_memalign`.
+const MALLOC_ALIGN: usize = 16;
+
 #[no_mangle]
 pub extern "C" fn roc_alloc(length: usize, alignment: usize) -> *mut c_void {
-    let align = alignment.max(16);
-    let mut p: *mut c_void = std::ptr::null_mut();
-    // SAFETY: align is a power of two and a multiple of the pointer size.
-    if unsafe { libc::posix_memalign(&mut p, align, length.max(1)) } != 0 {
+    let p = if alignment <= MALLOC_ALIGN {
+        // SAFETY: plain malloc of at least one byte.
+        unsafe { libc::malloc(length.max(1)) }
+    } else {
+        let mut p: *mut c_void = std::ptr::null_mut();
+        // SAFETY: alignment is a power of two and a multiple of the pointer size.
+        if unsafe { libc::posix_memalign(&mut p, alignment, length.max(1)) } != 0 {
+            p = std::ptr::null_mut();
+        }
+        p
+    };
+    if p.is_null() {
         eprintln!("roc_alloc: out of memory");
         std::process::abort();
     }
     LIVE_BLOCKS.with(|n| n.set(n.get() + 1));
+    ALLOCATIONS.with(|n| n.set(n.get() + 1));
     p
 }
 
@@ -281,10 +300,22 @@ pub unsafe extern "C" fn roc_dealloc(ptr: *mut c_void, _alignment: usize) {
     unsafe { libc::free(ptr) }
 }
 
+/// Grows in place where `realloc` can; a block of a wider alignment moves.
+///
 /// # Safety
 /// `ptr` is a live block from `roc_alloc`.
 #[no_mangle]
 pub unsafe extern "C" fn roc_realloc(ptr: *mut c_void, new_length: usize, alignment: usize) -> *mut c_void {
+    if alignment <= MALLOC_ALIGN {
+        // SAFETY: ptr came from malloc, as its alignment shows.
+        let p = unsafe { libc::realloc(ptr, new_length.max(1)) };
+        ALLOCATIONS.with(|n| n.set(n.get() + 1));
+        if p.is_null() {
+            eprintln!("roc_realloc: out of memory");
+            std::process::abort();
+        }
+        return p;
+    }
     let fresh = roc_alloc(new_length, alignment);
     // SAFETY: ptr is a live block of at least its usable size.
     unsafe {
