@@ -49,6 +49,23 @@ Writer := [].{
 	## The rows of a Struct; each field has its own writer.
 	Row : { len : U64, nulls : List(U64) }
 
+	## One open row of a text or binary writer, written in parts: each
+	## `part_*` appends to the data buffer, and the `*_end` of the writer that
+	## began the row closes it. `w` is the rest of that writer. An open row is
+	## not a writer and a writer is not an open row, so a push, a NULL or a
+	## finish inside a row, a part outside one, and a second end are type
+	## errors.
+	Text(w) : { open : w, data : List(U8), start : U64 }
+
+	## The rest of a `Var` while a row is open.
+	VarOpen : { offs : List(I32), nulls : List(U64) }
+
+	## The rest of a `LargeVar` while a row is open.
+	LargeVarOpen : { offs : List(I64), nulls : List(U64) }
+
+	## The rest of a `Views` while a row is open.
+	ViewsOpen : { words : List(U32), nulls : List(U64) }
+
 	## Room for `rows` values.
 	prim : U64 -> Writer.Prim(a)
 	prim = |rows| { values: List.with_capacity(rows), nulls: [] }
@@ -153,6 +170,68 @@ Writer := [].{
 		leaf(offs.len() - 1, nulls, cleared, [I32s(offs), U8s(data)])
 	}
 
+	## Open a row to write in parts. Close it with `str_end`.
+	str_begin : Writer.Var -> Writer.Text(Writer.VarOpen)
+	str_begin = |w| {
+		{ offs, data, nulls } = w
+		start = data.len()
+		{ open: { offs, nulls }, data, start }
+	}
+
+	## Close a row that `str_begin` opened: its bytes are the parts.
+	str_end : Writer.Text(Writer.VarOpen) -> Writer.Var
+	str_end = |t| {
+		{ open, data, .. } = t
+		{ offs, nulls } = open
+		end = data.len().to_i32_wrap()
+		{ offs: offs.append(end), data, nulls }
+	}
+
+	## Append a string's UTF-8 bytes to an open row.
+	part_str : Writer.Text(w), Str -> Writer.Text(w)
+	part_str = |t, s| {
+		{ open, data, start } = t
+		{ open, data: put_str(data, s), start }
+	}
+
+	## Append bytes to an open row, as they are. In a Utf8 column, keep the
+	## row valid UTF-8 (as with `bytes_push`).
+	part_bytes : Writer.Text(w), List(U8) -> Writer.Text(w)
+	part_bytes = |t, xs| {
+		{ open, data, start } = t
+		{ open, data: put_bytes(data, xs), start }
+	}
+
+	## Append `span` of row `at` of a column (`Utf8Column` or `BinaryColumn`)
+	## to an open row: one copy, no `Str` and no slice. The span is relative
+	## to the row's start and cut to the row; see the column's `append_span`.
+	part_range : Writer.Text(w), c, U64, { start : U64, len : U64 } -> Writer.Text(w)
+		where [c.append_span : c, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)]
+	part_range = |t, col, at, span| {
+		{ open, data, start } = t
+		{ open, data: col.append_span(at, span, AsIs, data), start }
+	}
+
+	## `part_range` with ASCII letters in upper case; other bytes as they are.
+	part_upper : Writer.Text(w), c, U64, { start : U64, len : U64 } -> Writer.Text(w)
+		where [c.append_span : c, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)]
+	part_upper = |t, col, at, span| {
+		{ open, data, start } = t
+		{ open, data: col.append_span(at, span, AsciiUpper, data), start }
+	}
+
+	## `part_range` with ASCII letters in lower case; other bytes as they are.
+	part_lower : Writer.Text(w), c, U64, { start : U64, len : U64 } -> Writer.Text(w)
+		where [c.append_span : c, U64, { start : U64, len : U64 }, [AsIs, AsciiUpper, AsciiLower], List(U8) -> List(U8)]
+	part_lower = |t, col, at, span| {
+		{ open, data, start } = t
+		{ open, data: col.append_span(at, span, AsciiLower, data), start }
+	}
+
+	## The bytes written to an open row so far.
+	part_len : Writer.Text(w) -> U64
+	part_len = |t| t.data.len() - t.start
+
 	## Room for `rows` values and `bytes` bytes of data (at least 8 per row).
 	large_varlen : U64, U64 -> Writer.LargeVar
 	large_varlen = |rows, bytes| { offs: List.with_capacity(rows + 1).append(0), data: List.with_capacity(bytes.max(rows * 8)), nulls: [] }
@@ -189,6 +268,23 @@ Writer := [].{
 	large_var_finish = |w, cleared| {
 		{ offs, data, nulls } = w
 		leaf(offs.len() - 1, nulls, cleared, [I64s(offs), U8s(data)])
+	}
+
+	## Open a row to write in parts. Close it with `large_str_end`.
+	large_str_begin : Writer.LargeVar -> Writer.Text(Writer.LargeVarOpen)
+	large_str_begin = |w| {
+		{ offs, data, nulls } = w
+		start = data.len()
+		{ open: { offs, nulls }, data, start }
+	}
+
+	## Close a row that `large_str_begin` opened.
+	large_str_end : Writer.Text(Writer.LargeVarOpen) -> Writer.LargeVar
+	large_str_end = |t| {
+		{ open, data, .. } = t
+		{ offs, nulls } = open
+		end = data.len().to_i64_wrap()
+		{ offs: offs.append(end), data, nulls }
 	}
 
 	## Values of `width` bytes, room for `rows` of them.
@@ -273,6 +369,31 @@ Writer := [].{
 			{ words: words.append(size.to_u32_wrap()).append($w1).append($w2).append($w3), data, nulls }
 		} else {
 			{ words: words.append(size.to_u32_wrap()).append($w1).append(0).append(at), data: $d, nulls }
+		}
+	}
+
+	## Open a row to write in parts. Close it with `views_str_end`. The parts
+	## go to the data buffer; a row of 12 bytes or less moves into its view
+	## at the end.
+	views_str_begin : Writer.Views -> Writer.Text(Writer.ViewsOpen)
+	views_str_begin = |w| {
+		{ words, data, nulls } = w
+		start = data.len()
+		{ open: { words, nulls }, data, start }
+	}
+
+	## Close a row that `views_str_begin` opened.
+	views_str_end : Writer.Text(Writer.ViewsOpen) -> Writer.Views
+	views_str_end = |t| {
+		{ open, data, start } = t
+		{ words, nulls } = open
+		size = data.len() - start
+		if size <= 12 {
+			next = words.append(size.to_u32_wrap()).append(le_u32(data, start)).append(le_u32(data, start + 4)).append(le_u32(data, start + 8))
+			{ words: next, data: data.take_first(start), nulls }
+		} else {
+			next = words.append(size.to_u32_wrap()).append(le_u32(data, start)).append(0).append(start.to_u32_wrap())
+			{ words: next, data, nulls }
 		}
 	}
 
@@ -623,4 +744,123 @@ expect {
 		and words_ok
 		and out.buffers.get(0) == Ok(U8s([0b1111_1101]))
 		and [col.get_bytes(0), col.get_bytes(1), col.get_bytes(2)] == [Ok([1, 2]), Err(Null), Ok(tail)]
+}
+
+import Utf8Column
+
+# Rows in several scripts, an empty row and spaces at the ends.
+part_rows : List(Str)
+part_rows = ["  hello world  ", "", "été à Paris", "日本語 テキスト", " 🎉party🚀 ", "x", "a string longer than twenty-three bytes"]
+
+part_src : Utf8Column
+part_src = Utf8Column.from_array(Array.from_strs(part_rows)) ?? crash "view"
+
+# Row `i` as parts: a Str, bytes, the trimmed first word in upper case, and
+# the rest of the trimmed row in lower case.
+parts_of : Writer.Text(w), U64 -> Writer.Text(w)
+parts_of = |t, i| {
+	trim = part_src.trim_ascii(i)
+	word = part_src.first_word(i, trim)
+	rest = { start: word.start + word.len, len: trim.len - word.len }
+	t
+		|> Writer.part_str("<")
+		|> Writer.part_bytes([0x7C])
+		|> Writer.part_upper(part_src, i, word)
+		|> Writer.part_lower(part_src, i, rest)
+		|> Writer.part_str("é>")
+}
+
+# What `parts_of` writes, from Str builtins.
+parts_want : List(Str)
+parts_want = ["<|HELLO worldé>", "<|é>", "<|éTé à parisé>", "<|日本語 テキストé>", "<|🎉PARTY🚀é>", "<|Xé>", "<|A string longer than twenty-three bytesé>"]
+
+# Utf8: every row in parts, a NULL row between, and `part_len` per row.
+expect {
+	var $w = Writer.varlen(8, 0)
+	var $lens = []
+	for i in (0.U64).until(part_rows.len()) {
+		t = parts_of(Writer.str_begin($w), i)
+		$lens = $lens.append(Writer.part_len(t))
+		$w = Writer.var_null(Writer.str_end(t))
+	}
+	out = Writer.var_finish($w, [])
+	want = parts_want.join_map(|s| [Ok(s), Err(Null)])
+	strs_back(out, Utf8) == want and $lens == parts_want.map(|s| s.count_utf8_bytes())
+}
+
+# LargeUtf8: the same rows; an empty row in parts.
+expect {
+	var $w = Writer.large_varlen(8, 0)
+	for i in (0.U64).until(part_rows.len()) {
+		$w = Writer.large_str_end(parts_of(Writer.large_str_begin($w), i))
+	}
+	$w = Writer.large_str_end(Writer.large_str_begin($w))
+	strs_back(Writer.large_var_finish($w, []), LargeUtf8) == parts_want.map(|s| Ok(s)).append(Ok(""))
+}
+
+# Utf8View: a row in parts gives the views and data of `views_str_push` at
+# every size class (inline, 12 bytes, small Str, long), between long rows.
+expect {
+	texts = ["", "abcde", "twelve bytes", "thirteen byte", "twenty-three bytes long", long, "hi", long]
+	whole = texts.fold(Writer.views(8, 0), Writer.views_str_push)
+	in_parts = texts.fold(
+		Writer.views(8, 0),
+		|w, s| {
+			n = s.count_utf8_bytes()
+			half = s.to_utf8().take_first(n // 2)
+			Writer.views_str_end(Writer.part_str(Writer.part_bytes(Writer.views_str_begin(w), half), Str.from_utf8_lossy(s.to_utf8().drop_first(n // 2))))
+		},
+	)
+	Writer.views_finish(in_parts, []).buffers == Writer.views_finish(whole, []).buffers
+}
+
+expect {
+	var $w = Writer.views(8, 0)
+	for i in (0.U64).until(part_rows.len()) {
+		$w = Writer.views_null(Writer.views_str_end(parts_of(Writer.views_str_begin($w), i)))
+	}
+	strs_back(Writer.views_finish($w, []), Utf8View) == parts_want.join_map(|s| [Ok(s), Err(Null)])
+}
+
+# A source column cut by a host offset, read through BinaryColumn in the
+# text layouts: trimmed spans in parts give the trimmed text.
+expect {
+	trimmed = |col| {
+		var $w = Writer.varlen(8, 0)
+		for i in (0.U64).until(col.len()) {
+			$w = Writer.str_end(Writer.part_range(Writer.str_begin($w), col, i, col.trim_ascii(i)))
+		}
+		strs_back(Writer.var_finish($w, []), Utf8)
+	}
+	large = Writer.large_var_finish(part_rows.fold(Writer.large_varlen(8, 0), Writer.large_str_push), [])
+	views = Writer.views_finish(part_rows.fold(Writer.views(8, 0), Writer.views_str_push), [])
+	view_of = |host, dt| BinaryColumn.from_array((Array.from_host(host, dt) ?? crash "import").slice(2, 5)) ?? crash "view"
+	want = part_rows.sublist({ start: 2, len: 5 }).map(|s| Ok(s.trim()))
+	trimmed(view_of(large, LargeUtf8)) == want and trimmed(view_of(views, Utf8View)) == want and trimmed(Utf8Column.from_array(Array.from_strs(part_rows).slice(2, 5)) ?? crash "view") == want
+}
+
+# A row cut into two spans at every byte gives the row back: an end inside
+# a character moves back to its first byte in both spans.
+expect {
+	row = "aé日🎉 x"
+	col = Utf8Column.from_array(Array.from_strs([row])) ?? crash "view"
+	n = row.count_utf8_bytes()
+	w = (0.U64).until(n + 1).fold(
+		Writer.varlen(n + 1, 0),
+		|acc, k| Writer.str_end(Writer.part_range(Writer.part_range(Writer.str_begin(acc), col, 0, { start: 0, len: k }), col, 0, { start: k, len: n })),
+	)
+	strs_back(Writer.var_finish(w, []), Utf8) == List.repeat(Ok(row), n + 1)
+}
+
+# A text column read through BinaryColumn moves a span end inside a
+# character back to its first byte; a Binary column of the same bytes does
+# not, as it has no characters.
+expect {
+	text = Writer.large_var_finish(Writer.large_str_push(Writer.large_varlen(1, 0), "aé日"), [])
+	bytes = Writer.large_var_finish(Writer.large_bytes_push(Writer.large_varlen(1, 0), "aé日".to_utf8()), [])
+	col = |host, dt| BinaryColumn.from_array(Array.from_host(host, dt) ?? crash "import") ?? crash "view"
+	span = |c, start, len| c.append_span(0, { start, len }, AsIs, [])
+	t = col(text, LargeUtf8)
+	b = col(bytes, LargeBinary)
+	span(t, 2, 1) == "é".to_utf8() and span(t, 2, 3) == "é".to_utf8() and span(t, 4, 9) == "日".to_utf8() and span(b, 2, 1) == [0xA9] and span(b, 4, 2) == [0x97, 0xA5]
 }
