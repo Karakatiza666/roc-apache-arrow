@@ -249,12 +249,14 @@ arrow-rs array ◀──from_ffi + validate_full── C ArrowArray ◀── Ho
 | out | [src/export.rs](tests/contender/src/export.rs) | a Roc result as a C array over the Roc lists; its release callback gives the value back to Roc |
 | checks | [src/check.rs](tests/contender/src/check.rs), [src/digest.rs](tests/contender/src/digest.rs) | identity, digest and accept checks, and a shrinker that cuts a failing array to the fewest rows |
 | data | [src/gen.rs](tests/contender/src/gen.rs), [src/mutate.rs](tests/contender/src/mutate.rs) | seeded random arrays; mutations at the buffer level |
+| load | [src/lineitem.rs](tests/contender/src/lineitem.rs), [src/bin/bench_lineitem.rs](tests/contender/src/bin/bench_lineitem.rs) | the lineitem table and job, written for Roc and for arrow-rs; the bench driver |
 
 | Entry point | Gives |
 |---|---|
 | `identity` | the array read through the views (`PrimitiveColumn`, `BoolColumn`, `BinaryColumn`, `Utf8Column`, `ListColumn`, `StructColumn`, `MapColumn`) and written again with `Writer` |
 | `digest` | a Utf8 column: one text per row, read with the checked reads and `Items` |
 | `validate` | one row: `accept`, or `refuse` and the error of `from_host` or of a view |
+| `lineitem` | a batch job over a table modeled on TPC-H lineitem: filter, Decimal128 prices, a text change, totals per group; see [PERFORMANCE.md](PERFORMANCE.md) |
 
 To add an entry point, add a branch to the `match` of `run` in `app.roc`,
 then run it from Rust:
@@ -275,6 +277,7 @@ value back to Roc when it is dropped.
 | valid, matrix | every leaf type, alone and in List, LargeList, FixedSizeList and Struct, with no, some and all NULLs, at 0, 1 and 37 rows | the same |
 | invalid | `2 × CONTENDER_CASES` arrays, each with every mutation that fits it | Roc's `validate` agrees with arrow-rs's `validate_full`, or the difference is in the list below |
 | edges | `null_count` -1; NULL buffers for an array of no rows | the same digest; accept |
+| lineitem | 20000 rows of the bench table, in batches of 8192 and of 7 rows | `lineitem` gives the output of an arrow-rs row loop and of arrow-rs kernels, with checked and trusted text |
 
 Each case runs with three feeds: typed lists, every buffer as `U8s` (Roc
 copies it), and the text of Utf8 and LargeUtf8 as a trusted `Utf8` `Str`.
@@ -323,6 +326,7 @@ Intended differences (Roc accepts, arrow-rs refuses):
 | `scripts/test-host.sh` | the C host test (Linux x86-64): zero-copy import, the `I128s` rule, trusted text and zero-copy export under AddressSanitizer, and one run per injected host fault, each of which must fail |
 | `scripts/test-contender.sh` | the differential tests against arrow-rs (Linux x64 and arm64), see [Differential tests against arrow-rs](#differential-tests-against-arrow-rs) |
 | `scripts/bench-host.sh` | times `Utf8Column` over 100k rows with `U8s` and with `Utf8` text (Linux x86-64) |
+| `scripts/bench-contender.sh` | the lineitem bench against arrow-rs (Linux x64 and arm64), see [PERFORMANCE.md](PERFORMANCE.md) |
 | `scripts/bundle.sh` | writes `dist/<hash>.tar.zst` and checks that it holds every module |
 | `scripts/test_bundle.sh` | runs the examples against the bundle, by path and over localhost |
 | `scripts/glue.sh` | makes the C header again |
@@ -338,6 +342,7 @@ are not in it.
 | `release.yml` | a pushed version tag: test, bundle, test the bundle, draft the release |
 | `test-nightly-roc.yml` | daily: the latest release on the latest nightly |
 | `deploy-docs.yml` | each push to main: `roc docs` to GitHub Pages |
+| `bench.yml` | by hand only: the lineitem bench on Linux x64 and arm64; the report goes to the job summary and an artifact |
 
 ## Changelog
 
