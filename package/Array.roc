@@ -9,7 +9,10 @@ import Validity
 ##
 ## Row 0 is always the first logical row: the Arrow `offset` is applied once
 ## at import by slicing, which is zero-copy for every buffer kind.
-Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
+##
+## `text` keeps the data buffer of a Utf8 or LargeUtf8 array when the host
+## passed it as a `Str` (`Host.Buffer.Utf8`), so a view need not check it.
+Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body, text : Try(Str, [NoText]) }.{
 
 	## The typed buffers of an array, by physical layout. Readable by anyone;
 	## only this module builds an `Array` around one.
@@ -53,7 +56,10 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 
 	## Import a host array of the given type. Validates buffer kinds, sizes and
 	## offsets once. Typed host buffers are wrapped with zero copy; `U8s`
-	## buffers for typed data are decoded (one copy).
+	## buffers for typed data are decoded (one copy). The data buffer of a
+	## binary or text type may be `Utf8(str)`: Roc takes the bytes of the `Str`
+	## with zero copy and does not check them. For Utf8 and LargeUtf8 the array
+	## keeps the `Str` (see `trusted_text`).
 	from_host : Host.Array, DataType -> Try(Array, [InvalidArray(Str), Unsupported(Str)])
 	from_host = |host, dt| {
 		rows = to_u64(host.length, "length")?
@@ -95,6 +101,11 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 				Ok(Fixed(w, bytes.sublist({ start: offset * w, len: rows * w })))
 			}
 		}
+		text = match (dt, buf(2)) {
+			(Utf8, Utf8(str)) => Ok(str)
+			(LargeUtf8, Utf8(str)) => Ok(str)
+			_ => Err(NoText)
+		}
 		b = match dt {
 			Null => Ok(NoBuffers)
 			Boolean => {
@@ -122,13 +133,13 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 			FixedSizeBinary(w) => fixed(w)
 			Binary | Utf8 => {
 				offs = typed_i32s(buf(1))?
-				data = typed_u8s(buf(2))?
+				data = typed_data(buf(2))?
 				check_offsets(offs, offset, rows, data.len(), |o| o.to_i64())?
 				Ok(Var32(offs.sublist({ start: offset, len: rows + 1 }), data))
 			}
 			LargeBinary | LargeUtf8 => {
 				offs = typed_i64s(buf(1))?
-				data = typed_u8s(buf(2))?
+				data = typed_data(buf(2))?
 				check_offsets(offs, offset, rows, data.len(), |o| o)?
 				Ok(Var64(offs.sublist({ start: offset, len: rows + 1 }), data))
 			}
@@ -175,11 +186,13 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 			ListView(_) | LargeListView(_) | Union(_, _, _) | Dictionary(_, _, _) | RunEndEncoded(_, _) =>
 				Err(Unsupported(unsupported_name(dt)))
 		}
-		Ok({ dt, rows, valid, buffers: b? })
+		Ok({ dt, rows, valid, buffers: b?, text })
 	}
 
 	## Export to the host form: offset 0, typed buffers, Roc-owned or static
-	## lists as they are. The host keeps static (borrowed) buffers alive.
+	## lists as they are. The host keeps static (borrowed) buffers alive. A
+	## text buffer that came in as `Utf8(str)` goes out as `U8s` over the same
+	## bytes, so an export never holds a `Utf8` buffer.
 	to_host : Array -> Host.Array
 	to_host = |arr| {
 		bitmap = match arr.valid.to_bitmap(arr.rows) {
@@ -232,6 +245,13 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 	body : Array -> Array.Body
 	body = |arr| arr.buffers
 
+	## The data buffer of a Utf8 or LargeUtf8 array as the `Str` the host
+	## passed (`Host.Buffer.Utf8`), not checked by Roc. It is the whole buffer,
+	## not cut to the rows: cut it at the offsets of `body`. `Err(NoText)` when
+	## the host passed bytes. O(1), no copy.
+	trusted_text : Array -> Try(Str, [NoText])
+	trusted_text = |arr| arr.text
+
 	## Whether row `row` holds a value. False past the end, and for every row of a Null array.
 	is_valid : Array, U64 -> Bool
 	is_valid = |arr, row| row < arr.rows and arr.valid.is_valid(row) and arr.dt != Null
@@ -282,7 +302,7 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 			FixedList(size, child) => FixedList(size, child.slice(start * size, count * size))
 			Children(kids) => Children(kids.map(|c| c.slice(start, count)))
 		}
-		{ dt: arr.dt, rows: count, valid: arr.valid.skip(start), buffers: b }
+		{ dt: arr.dt, rows: count, valid: arr.valid.skip(start), buffers: b, text: arr.text }
 	}
 
 	## Wrap a typed list as a primitive array with zero copy. The list's
@@ -290,25 +310,25 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 	from_body : DataType, U64, Validity, Array.Body -> Try(Array, [InvalidArray(Str), Unsupported(Str)])
 	from_body = |dt, rows, valid, b| {
 		# Validate by round-tripping through the host form, which checks sizes.
-		host = Array.to_host({ dt, rows, valid, buffers: b })
+		host = Array.to_host({ dt, rows, valid, buffers: b, text: Err(NoText) })
 		Array.from_host(host, dt)
 	}
 
 	## A non-null UInt8 array over these bytes, zero copy.
 	from_u8s : List(U8) -> Array
-	from_u8s = |xs| { dt: UInt8, rows: xs.len(), valid: AllValid, buffers: U8s(xs) }
+	from_u8s = |xs| { dt: UInt8, rows: xs.len(), valid: AllValid, buffers: U8s(xs), text: Err(NoText) }
 
 	## A non-null Int64 array, zero copy.
 	from_i64s : List(I64) -> Array
-	from_i64s = |xs| { dt: Int64, rows: xs.len(), valid: AllValid, buffers: I64s(xs) }
+	from_i64s = |xs| { dt: Int64, rows: xs.len(), valid: AllValid, buffers: I64s(xs), text: Err(NoText) }
 
 	## A non-null Int32 array, zero copy.
 	from_i32s : List(I32) -> Array
-	from_i32s = |xs| { dt: Int32, rows: xs.len(), valid: AllValid, buffers: I32s(xs) }
+	from_i32s = |xs| { dt: Int32, rows: xs.len(), valid: AllValid, buffers: I32s(xs), text: Err(NoText) }
 
 	## A non-null Float64 array, zero copy.
 	from_f64s : List(F64) -> Array
-	from_f64s = |xs| { dt: Float64, rows: xs.len(), valid: AllValid, buffers: F64s(xs) }
+	from_f64s = |xs| { dt: Float64, rows: xs.len(), valid: AllValid, buffers: F64s(xs), text: Err(NoText) }
 
 	## A Utf8 array (one copy of the text).
 	from_strs : List(Str) -> Array
@@ -321,7 +341,7 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 				{ offs: acc.offs.append(data.len().to_i32_wrap()), data }
 			},
 		)
-		{ dt: Utf8, rows: xs.len(), valid: AllValid, buffers: Var32(built.offs, built.data) }
+		{ dt: Utf8, rows: xs.len(), valid: AllValid, buffers: Var32(built.offs, built.data), text: Err(NoText) }
 	}
 
 	## The same buffers under another type of the same physical layout, for
@@ -344,12 +364,12 @@ Array :: { dt : DataType, rows : U64, valid : Validity, buffers : Array.Body }.{
 		if List.map2(schema.fields, cols, |f, c| f.data_type == c.dt).any(|same| !same) {
 			return Err(InvalidArray("a column's type differs from its field"))
 		}
-		Ok({ dt: Struct(schema.fields), rows, valid: AllValid, buffers: Children(cols) })
+		Ok({ dt: Struct(schema.fields), rows, valid: AllValid, buffers: Children(cols), text: Err(NoText) })
 	}
 
 	## An all-null array of the Null type.
 	nulls : U64 -> Array
-	nulls = |rows| { dt: Null, rows, valid: AllValid, buffers: NoBuffers }
+	nulls = |rows| { dt: Null, rows, valid: AllValid, buffers: NoBuffers, text: Err(NoText) }
 }
 
 unsupported_name : DataType -> Str
@@ -428,6 +448,14 @@ typed_u8s = |b| match b {
 	U8s(xs) => Ok(xs)
 	Absent => Ok([])
 	_ => wrong("U8s")
+}
+
+## The data buffer of a binary or text type: bytes, or the bytes of a trusted
+## `Str` with zero copy.
+typed_data : Host.Buffer -> Try(List(U8), [InvalidArray(Str), Unsupported(Str)])
+typed_data = |b| match b {
+	Utf8(str) => Ok(str.to_utf8())
+	_ => typed_u8s(b)
 }
 
 typed_i8s : Host.Buffer -> Try(List(I8), [InvalidArray(Str), Unsupported(Str)])
@@ -602,4 +630,38 @@ expect {
 	list = Array.from_host(host, DataType.list_of(Int64)) ?? crash "import"
 	batch = Array.from_columns(schema_ab, [Array.from_i64s([1, 2, 3]), Array.from_strs(["x", "y", "z"])]) ?? crash "batch"
 	list.children().map(Array.len) == [3] and batch.slice(1, 2).children().map(Array.len) == [2, 2] and Array.from_i64s([1]).children().is_empty()
+}
+
+# Utf8 and LargeUtf8 keep a trusted Str through slice and with_validity; a
+# Binary array and a U8s data buffer have none.
+expect {
+	text = "a trusted text of more than 23 bytes"
+	host = |offs| { length: 1, null_count: 0, offset: 0, buffers: [Absent, offs, Utf8(text)], children: [], dictionary: [] }
+	utf8 = Array.from_host(host(I32s([0, 3])), Utf8) ?? crash "utf8"
+	large = Array.from_host(host(I64s([0, 3])), LargeUtf8) ?? crash "large"
+	binary = Array.from_host(host(I32s([0, 3])), Binary) ?? crash "binary"
+	bytes = Array.from_host({ length: 1, null_count: 0, offset: 0, buffers: [Absent, I32s([0, 3]), U8s(text.to_utf8())], children: [], dictionary: [] }, Utf8) ?? crash "bytes"
+	same = |arr| arr.trusted_text() == Ok(text)
+	same(utf8) and same(utf8.slice(1, 0)) and same(utf8.with_validity(AllValid)) and same(large) and binary.trusted_text() == Err(NoText) and bytes.trusted_text() == Err(NoText)
+}
+
+# A trusted Str is the data buffer: its bytes, checked against the offsets.
+expect {
+	host = |offs| { length: 2, null_count: 0, offset: 0, buffers: [Absent, I32s(offs), Utf8("aé")], children: [], dictionary: [] }
+	ok = match Array.from_host(host([0, 1, 3]), Binary) {
+		Ok(arr) =>
+			match arr.body() {
+				Var32(_, data) => data == "aé".to_utf8()
+				_ => Bool.False
+			}
+		Err(_) => Bool.False
+	}
+	ok and Array.from_host(host([0, 1, 4]), Utf8).is_err()
+}
+
+# A trusted Str exports as U8s over the same bytes.
+expect {
+	host = { length: 1, null_count: 0, offset: 0, buffers: [Absent, I64s([0, 2]), Utf8("hé")], children: [], dictionary: [] }
+	out = (Array.from_host(host, LargeUtf8) ?? crash "import").to_host()
+	out.buffers.get(2) == Ok(U8s("hé".to_utf8()))
 }

@@ -11,7 +11,13 @@ Host :: [].{
 	## One Arrow buffer. The host picks the typed variant from the buffer's role
 	## in the format string; `U8s` is always accepted and Roc copies it into
 	## the typed form (the pure-Roc and unaligned path). `Absent` is a NULL
-	## buffer pointer. Tags are numbered alphabetically: Absent = 0 ... U8s = 11.
+	## buffer pointer. Tags are numbered alphabetically: Absent = 0 ... U8s = 11,
+	## Utf8 = 12.
+	##
+	## `Utf8` is the trusted text path: the data buffer of a Utf8 or LargeUtf8
+	## array as a `Str`, so Roc does not check its UTF-8. The host promises that
+	## the bytes are valid UTF-8. Roc does not check this, and invalid bytes
+	## break the invariants of `Str`. A host that cannot promise it passes `U8s`.
 	Buffer := [
 		Absent,
 		F32s(List(F32)),
@@ -25,10 +31,11 @@ Host :: [].{
 		U32s(List(U32)),
 		U64s(List(U64)),
 		U8s(List(U8)),
+		Utf8(Str),
 	].{
 		is_eq : _
 
-		## The number of elements, not bytes.
+		## The number of elements, not bytes. Bytes for `Utf8`.
 		len : Host.Buffer -> U64
 		len = |buffer| match buffer {
 			Absent => 0
@@ -43,6 +50,7 @@ Host :: [].{
 			U32s(xs) => xs.len()
 			U64s(xs) => xs.len()
 			U8s(xs) => xs.len()
+			Utf8(text) => text.count_utf8_bytes()
 		}
 	}
 
@@ -90,6 +98,7 @@ Host :: [].{
 }
 
 expect Host.Buffer.len(I64s([1, 2, 3])) == 3
+expect Host.Buffer.len(Utf8("aé")) == 3
 expect Host.empty_array(4).length == 4
 
 # The flags hold the values of the C Data Interface.

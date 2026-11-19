@@ -234,7 +234,8 @@ enum {
     HostBufferTag_U16s = 8,
     HostBufferTag_U32s = 9,
     HostBufferTag_U64s = 10,
-    HostBufferTag_U8s = 11
+    HostBufferTag_U8s = 11,
+    HostBufferTag_Utf8 = 12
 };
 typedef union {
     uint8_t absent;
@@ -249,6 +250,7 @@ typedef union {
     RocList u32s;
     RocList u64s;
     RocList u8s;
+    RocStr utf8;
 } HostBufferTagPayloadStorage;
 #if UINTPTR_MAX == UINT64_MAX
 struct HostBuffer {
@@ -394,6 +396,17 @@ static inline HostBuffer HostBuffer_make_u8s(RocList payload) {
     return out;
 }
 
+static inline HostBuffer HostBuffer_make_utf8(RocStr payload) {
+    HostBuffer out = {0};
+    out.tag = HostBufferTag_Utf8;
+#if UINTPTR_MAX == UINT64_MAX
+    out.payload.utf8 = payload;
+#else
+    roc_abi_copy_bytes(out.payload, &payload, sizeof(payload));
+#endif
+    return out;
+}
+
 static inline RocList HostBuffer_payload_f32s(const HostBuffer* value) {
 #if UINTPTR_MAX == UINT64_MAX
     return value->payload.f32s;
@@ -499,6 +512,16 @@ static inline RocList HostBuffer_payload_u8s(const HostBuffer* value) {
     return value->payload.u8s;
 #else
     RocList payload;
+    roc_abi_copy_bytes(&payload, value->payload, sizeof(payload));
+    return payload;
+#endif
+}
+
+static inline RocStr HostBuffer_payload_utf8(const HostBuffer* value) {
+#if UINTPTR_MAX == UINT64_MAX
+    return value->payload.utf8;
+#else
+    RocStr payload;
     roc_abi_copy_bytes(&payload, value->payload, sizeof(payload));
     return payload;
 #endif
