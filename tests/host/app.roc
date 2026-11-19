@@ -66,6 +66,21 @@ step = |input, schema| {
 			}
 			Ok(Writer.var_finish($w, []))
 		}
+		# Whether the text came in as a trusted Str, the valid rows, and the
+		# bytes of the valid rows as Utf8Column reads them.
+		"utf8_info" => {
+			col = Utf8Column.from_array(arr)?
+			var $valid = 0.I64
+			var $bytes = 0.I64
+			for i in (0.U64).until(col.len()) {
+				if col.is_valid(i) {
+					$valid = $valid + 1
+					$bytes = $bytes + col.at(i).count_utf8_bytes().to_i64_wrap()
+				}
+			}
+			trusted = if (arr.trusted_text().is_ok()) 1 else 0
+			Ok(Writer.prim_finish(Writer.prim_push(Writer.prim_push(Writer.prim_push(Writer.prim(3), trusted), $valid), $bytes), [], |xs| I64s(xs)))
+		}
 		_ => Err(UnknownStep(name))
 	}
 }

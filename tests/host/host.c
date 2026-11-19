@@ -156,6 +156,13 @@ static bool is_static(RocList l) { return l.capacity_or_alloc_ptr == static_word
 
 #define LIST_OF(array) static_list((array), sizeof(array) / sizeof((array)[0]))
 
+// A static Str: the same seamless slice and static word as a list, in the
+// field order of RocStr. Big form (the high bit of length clear) at any length.
+static RocStr static_str(const void *bytes, size_t length) {
+    RocStr s = {(uint8_t *)bytes, static_word(), length};
+    return s;
+}
+
 static HostSchema schema(const char *format, const char *name) {
     HostSchema s;
     memset(&s, 0, sizeof s);
@@ -366,6 +373,99 @@ static void test_export_i64(void) {
     release_and_check(&out, live);
 }
 
+// Text rows as the host holds them: a refcount word, then the bytes, so the
+// fault "utf8_owned" can pass them as an owned big Str.
+typedef struct {
+    intptr_t rc;
+    char bytes[64];
+} Text;
+
+// The trusted text path: the data buffer as a Str, which Roc does not check.
+// The fault "utf8_owned" passes an owned big Str (refcount 1, a capacity
+// word), whose refcount Roc then changes; "utf8_as_u8s" passes bytes, which
+// Roc checks.
+static HostBuffer text_buffer(Text *t, size_t length) {
+    if (faulty("utf8_as_u8s")) return HostBuffer_make_u8s(static_list(t->bytes, length));
+    if (faulty("utf8_owned")) {
+        t->rc = 1;
+        RocStr owned = {(uint8_t *)t->bytes, length << 1, length};
+        return HostBuffer_make_utf8(owned);
+    }
+    return HostBuffer_make_utf8(static_str(t->bytes, length));
+}
+
+// `out` holds row i of `rows` twice, NULL where `rows[i]` is NULL.
+static void check_repeated(const struct ArrowArray *out, const char *const *rows, int n) {
+    CHECK(out->length == n && out->n_buffers == 3, "shape of the result");
+    const int32_t *offs = out->buffers[1];
+    const char *data = out->buffers[2];
+    for (int i = 0; i < n; i++) {
+        bool is_valid = (((const uint8_t *)out->buffers[0])[0] >> i) & 1;
+        CHECK(is_valid == (rows[i] != NULL), "validity of row %d", i);
+        if (!rows[i]) continue;
+        size_t len = strlen(rows[i]);
+        CHECK((size_t)(offs[i + 1] - offs[i]) == 2 * len, "length of row %d", i);
+        CHECK(memcmp(data + offs[i], rows[i], len) == 0 && memcmp(data + offs[i] + len, rows[i], len) == 0,
+              "text of row %d", i);
+    }
+}
+
+// Roc reads rows from a Str over host memory with zero copy, and frees none
+// of it: text past 23 bytes, and text of 23 bytes or less in big form.
+static void test_trusted_utf8(void) {
+    static const char *const long_rows[5] = {"ab", "", NULL, "日本語テキスト", "🎉 naïve"};
+    static const char *const short_rows[3] = {"hé", NULL, "llo"};
+    struct {
+        const char *const *rows;
+        int n;
+    } cases[2] = {{long_rows, 5}, {short_rows, 3}};
+    for (int k = 0; k < 2; k++) {
+        size_t live = live_blocks();
+        const char *const *rows = cases[k].rows;
+        int n = cases[k].n;
+        static Text text;
+        static int32_t offsets[8];
+        static uint8_t valid[1];
+        memset(&text, 0, sizeof text);
+        valid[0] = 0;
+        size_t total = 0, valid_rows = 0;
+        for (int i = 0; i < n; i++) {
+            offsets[i] = (int32_t)total;
+            if (!rows[i]) continue;
+            valid[0] |= (uint8_t)(1u << i);
+            valid_rows++;
+            memcpy(text.bytes + total, rows[i], strlen(rows[i]));
+            total += strlen(rows[i]);
+        }
+        offsets[n] = (int32_t)total;
+        CHECK((total > 23) == (k == 0), "case %d holds %zu bytes", k, total);
+        HostBuffer bufs[3] = {HostBuffer_make_u8s(LIST_OF(valid)), HostBuffer_make_i32s(static_list(offsets, (size_t)n + 1)),
+                              text_buffer(&text, total)};
+        HostArray in = host_array(n, 1, bufs, 3);
+
+        HostArray info = roc_run(in, schema("u", "utf8_info"));
+        const int64_t *got = buffer_list(&info, 1).elements;
+        CHECK(got[0] == 1, "case %d: Roc kept the trusted Str", k);
+        CHECK(got[1] == (int64_t)valid_rows && got[2] == (int64_t)total, "case %d: %lld rows, %lld bytes", k,
+              (long long)got[1], (long long)got[2]);
+        drop(info);
+
+        // The data buffer comes back as bytes over the host's memory.
+        HostArray pass = roc_run(in, schema("u", "pass"));
+        RocList data = buffer_list(&pass, 2);
+        CHECK(buffer_tag(&pass, 2) == HostBufferTag_U8s, "case %d: text exports as U8s", k);
+        CHECK(data.elements == (const void *)text.bytes && data.length == total, "case %d: the bytes are the host's", k);
+        CHECK(is_static(data), "case %d: the bytes keep the static refcount word", k);
+        drop(pass);
+
+        struct ArrowArray out = export_array(roc_run(in, schema("u", "repeat_utf8")));
+        check_repeated(&out, rows, n);
+        release_and_check(&out, live);
+        CHECK(text.rc == 0 && STATIC_RC[0] == 0, "case %d: no refcount word changed", k);
+        CHECK(live_blocks() == live, "case %d: no Roc block leaks", k);
+    }
+}
+
 static void test_export_utf8(void) {
     size_t live = live_blocks();
     static const char text[] = "abh\xc3\xa9llo";
@@ -388,6 +488,59 @@ static void test_export_utf8(void) {
     release_and_check(&out, live);
 }
 
+#ifdef ARROW_HOST_BENCH
+#include <time.h>
+
+static double now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e9 + (double)t.tv_nsec;
+}
+
+// Reads every row of a 100k-row Utf8 column through Utf8Column (the step
+// "utf8_info"), with the text as U8s (checked) and as a trusted Str.
+static void bench_utf8(const char *label, const char *row) {
+    enum { ROWS = 100000, RUNS = 50 };
+    size_t width = strlen(row);
+    static int32_t offsets[ROWS + 1];
+    struct {
+        intptr_t rc;
+        char bytes[];
+    } *text = calloc(1, sizeof(intptr_t) + ROWS * width);
+    if (!text) abort();
+    for (size_t i = 0; i < ROWS; i++) {
+        memcpy(text->bytes + i * width, row, width);
+        offsets[i] = (int32_t)(i * width);
+    }
+    offsets[ROWS] = (int32_t)(ROWS * width);
+    double best[2] = {1e30, 1e30};
+    for (int run = 0; run < RUNS; run++) {
+        for (int trusted = 0; trusted < 2; trusted++) {
+            HostBuffer data = trusted ? HostBuffer_make_utf8(static_str(text->bytes, ROWS * width))
+                                      : HostBuffer_make_u8s(static_list(text->bytes, ROWS * width));
+            HostBuffer bufs[3] = {HostBuffer_make_absent(), HostBuffer_make_i32s(static_list(offsets, ROWS + 1)), data};
+            double t0 = now_ns();
+            HostArray info = roc_run(host_array(ROWS, 0, bufs, 3), schema("u", "utf8_info"));
+            double t = now_ns() - t0;
+            const int64_t *got = buffer_list(&info, 1).elements;
+            CHECK(got[0] == trusted && got[2] == (int64_t)(ROWS * width), "bench result");
+            drop(info);
+            if (t < best[trusted]) best[trusted] = t;
+        }
+    }
+    printf("%-6s %2zu bytes/row: U8s %6.2f ns/row, Utf8 %6.2f ns/row, saved %6.2f ns/row\n", label, width,
+           best[0] / ROWS, best[1] / ROWS, (best[0] - best[1]) / ROWS);
+    free(text);
+}
+
+int main(void) {
+    bench_utf8("ascii", "abcdefghijklmnopqrstuvwxyz012345");
+    bench_utf8("latin", "àéîõüçñàéîõüçñàé");
+    bench_utf8("multi", "日本語のテキスト😀abcd");
+    free_blocks();
+    return 0;
+}
+#else
 int main(void) {
     const char *f = getenv("ARROW_HOST_FAULT");
     if (f) fault = f;
@@ -395,7 +548,9 @@ int main(void) {
     test_import_i128();
     test_export_i64();
     test_export_utf8();
+    test_trusted_utf8();
     free_blocks();
     printf("host test: %d checks passed%s%s\n", checks, *fault ? " with fault " : "", fault);
     return 0;
 }
+#endif

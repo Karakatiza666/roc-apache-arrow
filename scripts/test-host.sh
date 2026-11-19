@@ -35,7 +35,7 @@ export ASAN_OPTIONS="detect_leaks=1:abort_on_error=0"
 "$work/host"
 
 # Each fault breaks one host rule; the run must fail.
-for fault in static_rc_one i64_as_u8s release_leaks i128_unaligned; do
+for fault in static_rc_one i64_as_u8s release_leaks i128_unaligned utf8_owned utf8_as_u8s; do
 	if ARROW_HOST_FAULT="$fault" "$work/host" > "$work/fault.log" 2>&1; then
 		echo "error: the host test passed with fault '$fault'" >&2
 		cat "$work/fault.log" >&2
