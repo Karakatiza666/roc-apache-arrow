@@ -8,17 +8,34 @@ import Validity
 ## no copy and no second validation. When the text is not valid UTF-8 (Arrow
 ## promises it is), each row decodes its own bytes, with replacement
 ## characters for the bad ones, and the column never fails.
+##
+## When the host passed the data buffer as `Host.Buffer.Utf8(str)`, the view
+## uses that `Str` and does not check it: the host promises valid UTF-8, and
+## invalid bytes break the invariants of `Str`. A `U8s` data buffer is
+## always checked.
 Utf8Column :: { offs : List(I32), data : List(U8), valid : Validity, text : Str, base : U64, bytes : U64 }.{
 
-	## The view of a Utf8 array. Checks the text once as UTF-8 (O(text bytes)) and
-	## copies nothing. Refuses any other type, LargeUtf8 and Utf8View included.
+	## The view of a Utf8 array. Checks the text once as UTF-8 (O(text bytes)),
+	## or not at all for a trusted `Str` (see `Array.trusted_text`), and copies
+	## nothing. Refuses any other type, LargeUtf8 and Utf8View included.
 	from_array : Array -> Try(Utf8Column, [TypeMismatch(DataType)])
 	from_array = |arr| match (arr.data_type(), arr.body()) {
 		(Utf8, Var32(offs, data)) => {
 			base = (offs.first() ?? 0).to_u64_wrap()
 			end = (offs.last() ?? 0).to_u64_wrap()
-			# Zero copy: the Str shares the data buffer.
-			text = Str.from_utf8(data.sublist({ start: base, len: end - base })) ?? ""
+			# Zero copy either way: the Str shares the data buffer.
+			cut = match arr.trusted_text() {
+				Ok(all) =>
+					match all.drop_first_bytes(base) {
+						Ok(rest) => rest.drop_last_bytes(data.len() - end)
+						Err(e) => Err(e)
+					}
+				Err(NoText) => Err(BadUtf8)
+			}
+			text = match cut {
+				Ok(str) => str
+				Err(_) => Str.from_utf8(data.sublist({ start: base, len: end - base })) ?? ""
+			}
 			Ok({ offs, data, valid: arr.validity(), text, base, bytes: end - base })
 		}
 		_ => Err(TypeMismatch(arr.data_type()))
@@ -125,4 +142,61 @@ expect {
 	col = Utf8Column.from_array(Array.from_host(host, Utf8) ?? crash "import") ?? crash "view"
 	all = Utf8Column.from_array(Array.from_strs(["x"])) ?? crash "view"
 	[col.is_valid(0), col.is_valid(1), col.is_valid(2), all.is_valid(0), all.is_valid(1)] == [Bool.False, Bool.True, Bool.False, Bool.True, Bool.False]
+}
+
+# Every row, `Err(Null)` at a NULL row.
+rows_of : Utf8Column -> List(Try(Str, [Null, OutOfBounds]))
+rows_of = |col| {
+	var $out = []
+	for i in (0.U64).until(col.len()) {
+		$out = $out.append(col.get(i))
+	}
+	$out
+}
+
+# Text rows in several scripts, with empty and NULL rows, as the host sends them.
+script_rows : List(Str)
+script_rows = ["abc", "", "été", "日本語", "🎉x", "gone", "naïve 🐦", ""]
+
+script_host : Host.Buffer, I64, I64 -> Host.Array
+script_host = |data, offset, length| {
+	offs = script_rows.fold([0.I32], |acc, r| acc.append((acc.last() ?? 0) + r.count_utf8_bytes().to_i32_wrap()))
+	# Row 5 is NULL.
+	{ length, null_count: -1, offset, buffers: [U8s([0b1101_1111]), I32s(offs), data], children: [], dictionary: [] }
+}
+
+script_want : List(Try(Str, [Null, OutOfBounds]))
+script_want = script_rows.map_with_index(|r, i| if (i == 5) Err(Null) else Ok(r))
+
+# A trusted Str and the same bytes give the same rows, whole and at an offset.
+expect {
+	text = Str.join_with(script_rows, "")
+	read = |data, offset, length| {
+		arr = Array.from_host(script_host(data, offset, length), Utf8) ?? crash "import"
+		rows_of(Utf8Column.from_array(arr) ?? crash "view")
+	}
+	trusted = read(Utf8(text), 0, 8)
+	trusted == script_want and read(U8s(text.to_utf8()), 0, 8) == script_want and read(Utf8(text), 2, 5) == script_want.sublist({ start: 2, len: 5 }) and read(U8s(text.to_utf8()), 2, 5) == read(Utf8(text), 2, 5)
+}
+
+# A trusted column exports bytes, and the bytes read back as the same rows.
+expect {
+	text = Str.join_with(script_rows, "")
+	arr = Array.from_host(script_host(Utf8(text), 1, 6), Utf8) ?? crash "import"
+	out = arr.to_host()
+	back = Array.from_host(out, Utf8) ?? crash "round trip"
+	bytes_out = match out.buffers.get(2) {
+		Ok(U8s(bytes)) => bytes == text.to_utf8()
+		_ => Bool.False
+	}
+	bytes_out and rows_of(Utf8Column.from_array(back) ?? crash "view") == script_want.sublist({ start: 1, len: 6 })
+}
+
+# A trusted column with no rows, and one of empty rows only.
+expect {
+	none = { length: 0, null_count: 0, offset: 0, buffers: [Absent, I32s([0]), Utf8("")], children: [], dictionary: [] }
+	empty = { length: 2, null_count: 0, offset: 0, buffers: [Absent, I32s([0, 0, 0]), Utf8("")], children: [], dictionary: [] }
+	a = Utf8Column.from_array(Array.from_host(none, Utf8) ?? crash "import") ?? crash "view"
+	b = Utf8Column.from_array(Array.from_host(empty, Utf8) ?? crash "import") ?? crash "view"
+	a.len() == 0 and rows_of(b) == [Ok(""), Ok("")] and b.is_valid_utf8()
 }
