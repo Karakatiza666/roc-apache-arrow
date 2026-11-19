@@ -8,6 +8,10 @@
 # | digest     | a Utf8 column: one canonical text per row of the input       |
 # | validate   | a Utf8 column of one row: "accept" or "refuse <error>"       |
 # | drop       | an empty array; the host gives a result back to Roc this way |
+# | lineitem   | one batch of the lineitem table: the rows shipped in a date range with their prices, and the totals per group |
+#
+# `lineitem_import` and `lineitem_numeric` stop after the import and after the
+# numeric work: the bench subtracts them to time each phase.
 #
 # To add an entry point, add a branch to `run` and call it from Rust with
 # `contender::call(<name>, ..)`.
@@ -55,6 +59,9 @@ run = |input, schema| {
 					}
 				Err(e) => crash "digest: ${Str.inspect(e)}"
 			}
+		"lineitem" => lineitem(input, schema, Full)
+		"lineitem_numeric" => lineitem(input, schema, Numeric)
+		"lineitem_import" => lineitem(input, schema, ImportOnly)
 		_ => crash "unknown entry point '${name}'"
 	}
 }
@@ -474,4 +481,179 @@ hex : List(U8) -> Str
 hex = |bytes| {
 	digit = |n| if (n < 10) n + 48 else n + 87
 	Str.from_utf8_lossy(bytes.fold([], |acc, b| acc.append(digit(b.shr_zf_wrap(4))).append(digit(b.bitwise_and(15)))))
+}
+
+# ---------------------------------------------------------------------------
+# lineitem: a batch of the lineitem table (a Struct) in, one Struct row out:
+#
+# | Field  | Value                                                              |
+# |--------|--------------------------------------------------------------------|
+# | rows   | the rows with ship_from <= shipdate < ship_until: orderkey, disc_price = extendedprice * (1 - discount), charge = disc_price * (1 + tax), comment_norm, comment_len |
+# | groups | per (returnflag, linestatus) with rows, in key order: the row count and the sums of quantity, extendedprice, disc_price and charge |
+#
+# A NULL operand makes a price NULL; a sum skips NULL prices. comment_norm is
+# the trimmed comment with its first word in ASCII uppercase.
+
+## 1994-01-01 and 1997-03-01 as days since 1970-01-01.
+ship_from : I32
+ship_from = 8766
+
+ship_until : I32
+ship_until = 9921
+
+Totals : { count : I64, qty : I128, base : I128, disc : I128, charge : I128 }
+
+lineitem : Host.Array, Host.Schema, [Full, Numeric, ImportOnly] -> Host.Array
+lineitem = |input, schema, phase| match lineitem_batch(input, schema, phase) {
+	Ok(out) => out
+	Err(e) => crash "lineitem: ${Str.inspect(e)}"
+}
+
+lineitem_batch : Host.Array, Host.Schema, [Full, Numeric, ImportOnly] -> Try(Host.Array, _)
+lineitem_batch = |input, schema, phase| {
+	table = StructColumn.from_array(import_input(input, schema)?)?
+	column = |name| table.column(name)
+	orderkey = PrimitiveColumn.i64(column("orderkey")?)?
+	quantity = PrimitiveColumn.i128(column("quantity")?)?
+	price = PrimitiveColumn.i128(column("extendedprice")?)?
+	discount = PrimitiveColumn.i128(column("discount")?)?
+	tax = PrimitiveColumn.i128(column("tax")?)?
+	flag = Utf8Column.from_array(column("returnflag")?)?
+	status = Utf8Column.from_array(column("linestatus")?)?
+	shipdate = PrimitiveColumn.i32(column("shipdate")?)?
+	comment = Utf8Column.from_array(column("comment")?)?
+	if phase == ImportOnly {
+		return Ok(Host.empty_array(0))
+	}
+	n = table.len()
+	var $rows = Writer.row(n)
+	var $keys = Writer.prim(n)
+	var $disc = Writer.prim(n)
+	var $charge = Writer.prim(n)
+	var $text = Writer.varlen(n, comment.data_len())
+	var $lens = Writer.prim(n)
+	var $totals = List.repeat({ count: 0, qty: 0, base: 0, disc: 0, charge: 0 }, 6)
+	for i in (0.U64).until(n) {
+		day = shipdate.at(i, 0)
+		if shipdate.is_valid(i) and day >= ship_from and day < ship_until {
+			base = price.at(i, 0)
+			disc = if (discount.is_valid(i)) Ok(base * (100 - discount.at(i, 0))) else Err(Null)
+			charge = match disc {
+				Ok(d) if tax.is_valid(i) => Ok(d * (100 + tax.at(i, 0)))
+				_ => Err(Null)
+			}
+			$rows = Writer.row_push($rows)
+			$keys = Writer.prim_push($keys, orderkey.at(i, 0))
+			$disc = match disc {
+				Ok(d) => Writer.prim_push($disc, d)
+				Err(_) => Writer.prim_null($disc, 0)
+			}
+			$charge = match charge {
+				Ok(c) => Writer.prim_push($charge, c)
+				Err(_) => Writer.prim_null($charge, 0)
+			}
+			if phase == Full {
+				if comment.is_valid(i) {
+					norm = normalize(comment.at(i))
+					$text = Writer.str_push($text, norm)
+					$lens = Writer.prim_push($lens, norm.count_utf8_bytes().to_i32_wrap())
+				} else {
+					$text = Writer.var_null($text)
+					$lens = Writer.prim_null($lens, 0)
+				}
+			}
+			g = group_of(flag.at(i), status.at(i))?
+			add = |t| { count: t.count + 1, qty: t.qty + quantity.at(i, 0), base: t.base + base, disc: t.disc + (disc ?? 0), charge: t.charge + (charge ?? 0) }
+			$totals = match $totals.update(g, add) {
+				Ok(ts) => ts
+				Err(OutOfBounds) => return Err(OutOfBounds)
+			}
+		}
+	}
+	if phase == Numeric {
+		return Ok(Host.empty_array(0))
+	}
+	kept = $rows.len
+	rows = Writer.row_finish(
+		$rows,
+		[],
+		[
+			Writer.prim_finish($keys, [], |xs| I64s(xs)),
+			Writer.prim_finish($disc, [], |xs| I128s(xs)),
+			Writer.prim_finish($charge, [], |xs| I128s(xs)),
+			Writer.var_finish($text, []),
+			Writer.prim_finish($lens, [], |xs| I32s(xs)),
+		],
+	)
+	one_list = |child, len| Writer.list_finish(Writer.list_push(Writer.lists({}), List.repeat({}, len), |c, _| c), [], |_| child)
+	groups = totals_out($totals)
+	Ok(Writer.row_finish(Writer.row_push(Writer.row(1)), [], [one_list(rows, kept), one_list(groups.array, groups.len)]))
+}
+
+## The group of a (returnflag, linestatus) pair: A, N, R times F, O.
+group_of : Str, Str -> Try(U64, [UnknownGroup(Str, Str)])
+group_of = |flag, status| {
+	f = match flag {
+		"A" => 0
+		"N" => 1
+		"R" => 2
+		_ => return Err(UnknownGroup(flag, status))
+	}
+	s = match status {
+		"F" => 0
+		"O" => 1
+		_ => return Err(UnknownGroup(flag, status))
+	}
+	Ok(f * 2 + s)
+}
+
+## The trimmed text with its first word in ASCII uppercase.
+normalize : Str -> Str
+normalize = |raw| {
+	trimmed = raw.trim()
+	match trimmed.split_first(" ") {
+		Ok({ before, after }) => "${before.with_ascii_uppercased()} ${after}"
+		Err(NotFound) => trimmed.with_ascii_uppercased()
+	}
+}
+
+## The groups with rows, in key order, as a Struct.
+totals_out : List(Totals) -> { array : Host.Array, len : U64 }
+totals_out = |totals| {
+	var $flags = Writer.varlen(6, 6)
+	var $statuses = Writer.varlen(6, 6)
+	var $count = Writer.prim(6)
+	var $qty = Writer.prim(6)
+	var $base = Writer.prim(6)
+	var $disc = Writer.prim(6)
+	var $charge = Writer.prim(6)
+	var $rows = Writer.row(6)
+	for g in (0.U64).until(6) {
+		t = totals.get(g) ?? { count: 0, qty: 0, base: 0, disc: 0, charge: 0 }
+		if t.count > 0 {
+			$flags = Writer.str_push($flags, ["A", "N", "R"].get(g // 2) ?? "")
+			$statuses = Writer.str_push($statuses, ["F", "O"].get(g % 2) ?? "")
+			$count = Writer.prim_push($count, t.count)
+			$qty = Writer.prim_push($qty, t.qty)
+			$base = Writer.prim_push($base, t.base)
+			$disc = Writer.prim_push($disc, t.disc)
+			$charge = Writer.prim_push($charge, t.charge)
+			$rows = Writer.row_push($rows)
+		}
+	}
+	len = $rows.len
+	array = Writer.row_finish(
+		$rows,
+		[],
+		[
+			Writer.var_finish($flags, []),
+			Writer.var_finish($statuses, []),
+			Writer.prim_finish($count, [], |xs| I64s(xs)),
+			Writer.prim_finish($qty, [], |xs| I128s(xs)),
+			Writer.prim_finish($base, [], |xs| I128s(xs)),
+			Writer.prim_finish($disc, [], |xs| I128s(xs)),
+			Writer.prim_finish($charge, [], |xs| I128s(xs)),
+		],
+	)
+	{ array, len }
 }

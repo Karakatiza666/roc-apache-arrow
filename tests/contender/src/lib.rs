@@ -15,6 +15,7 @@ pub mod digest;
 pub mod export;
 pub mod gen;
 pub mod import;
+pub mod lineitem;
 pub mod mutate;
 pub mod roc;
 
@@ -42,6 +43,12 @@ impl RocResult {
     /// and check it with `validate_full`.
     pub fn into_arrow(mut self, dt: &DataType) -> Result<ArrayRef, ArrowError> {
         export::to_arrow_checked(self.0.take().expect("a live result"), dt)
+    }
+
+    /// Import the value as an arrow-rs array of type `dt` with zero copy and
+    /// no `validate_full`, as a consumer that trusts its producer does.
+    pub fn into_arrow_unvalidated(mut self, dt: &DataType) -> Result<ArrayRef, ArrowError> {
+        export::to_arrow(self.0.take().expect("a live result"), dt).map(arrow::array::make_array)
     }
 
     /// The rows of a Utf8 result.
