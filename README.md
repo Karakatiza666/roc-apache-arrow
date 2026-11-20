@@ -10,6 +10,9 @@ them without a copy.
 | Out | typed column writers (`Writer`) | each value is written once, into the buffer the host gets; `*_finish` exports with no copy |
 | Dynamic | `Builder`, `ArrowEncoding` (derived `parser_for` / `encoder_for`), `Probe` | copies each value; for types known only at run time |
 
+`Ipc` reads the Arrow IPC streaming format (the bytes a server sends for a
+query result) into the same arrays, in pure Roc, with no host.
+
 The package holds only the Arrow format. A wrapper package adds the rules of
 an application.
 
@@ -18,7 +21,7 @@ an application.
 | Item | Value |
 |---|---|
 | Systems | Linux (x64, arm64) and macOS; Windows is not tested |
-| Tests | 297 `expect`s, 3 examples, 7 misuse files that must not type check, a C host test under AddressSanitizer, differential tests against arrow-rs |
+| Tests | 345 `expect`s, 3 examples, 7 misuse files that must not type check, a C host test under AddressSanitizer, differential tests against arrow-rs |
 
 ## Use it
 
@@ -112,6 +115,43 @@ group = match (flag.byte_len(i), flag.byte_at(i, 0)) {
 
 `Items` holds a source type, not a closure, because this compiler boxes a
 closure inside a `Try`, a tuple or a record (one allocation per value).
+
+## Read an Arrow IPC stream
+
+`Ipc` reads the Arrow IPC streaming format: a schema message, record
+batches, an end marker. It is pure Roc, so it needs no host. Each record
+batch is a non-null Struct `Array` whose children are the columns, so the
+views above and `ArrowEncoding.decode_row` read it.
+
+```roc
+result = Ipc.read_stream(bytes)?           # { schema : Schema, batches : List(Array) }
+batch = result.batches.first()?
+ids = PrimitiveColumn.i64(StructColumn.from_array(batch)?.column("id")?)?
+rows = batch.len()                         # batch.children() are the columns, in schema order
+```
+
+A stream that arrives in pieces (HTTP chunks, WebSocket frames) goes through
+an `Ipc.Reader`. A piece may end anywhere, also inside a message; `feed`
+gives the batches that the piece completed.
+
+```roc
+var $reader = Ipc.reader
+for piece in pieces {
+    fed = $reader.feed(piece)?             # { reader : Ipc.Reader, batches : List(Array) }
+    $reader = fed.reader
+    for batch in fed.batches { .. }
+}
+schema = $reader.finish()?                 # an error when the input ends inside a message
+```
+
+| Item | Rule |
+|---|---|
+| Errors | `InvalidIpc(Str)` for bytes that are not a valid stream, `Unsupported(Str)` for an Arrow feature that is not read. After an `Err`, do not feed the reader again |
+| End | `is_ended()` is true after the end marker; a feed after it does nothing. A stream may also stop after a whole message with no marker: `finish` accepts that |
+| Copies | validity bitmaps, Boolean bits, text and binary data, FixedSizeBinary values and view data are slices of the fed bytes; numeric values, offsets and views are decoded into typed lists (one copy). A batch keeps the bytes of its message alive |
+| Limits | a schema of at most 100000 fields, nested at most 64 deep; every length in the stream is checked against the bytes that are there |
+| Reads | metadata V4 and V5, little-endian, uncompressed, every type that `Array.from_host` takes |
+| Does not read | the file format (`ARROW1`), compressed bodies, dictionary batches and dictionary-encoded fields, unions, run-end encoded and list-view types, big-endian streams, the framing of Arrow before 0.15. There is no IPC writer |
 
 ## Write: typed column writers
 
@@ -402,6 +442,18 @@ are not in it.
 | `bench.yml` | by hand only: the lineitem bench on Linux x64 and arm64; the report goes to the job summary and an artifact |
 
 ## Changelog
+
+### 0.0.3
+
+| Change | Effect |
+|---|---|
+| `Ipc` | new module: reads the Arrow IPC streaming format in pure Roc, with no host |
+| `Ipc.read_stream` | new: a whole stream as its `Schema` and one non-null Struct `Array` per record batch |
+| `Ipc.reader`, `Ipc.Reader` with `feed`, `finish`, `schema`, `is_ended` | new: a stream that arrives in pieces, cut anywhere; the reader is opaque |
+| `Ipc.Err` | new: `[InvalidIpc(Str), Unsupported(Str)]`. The file format, compressed bodies, dictionaries, unions, run-end encoded and list-view types, big-endian streams and the framing of Arrow before 0.15 are refused, never read wrong |
+| `tests/ipc` | streams of a real server (arrow-rs) and small crafted streams, with the script that writes the crafted ones |
+
+The other modules are as in 0.0.2.
 
 ### 0.0.2
 

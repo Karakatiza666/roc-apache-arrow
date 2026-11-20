@@ -1,6 +1,7 @@
 # roc-apache-arrow API
 
-The public API of release 0.0.2, module by module. The signatures are the
+The public API of release 0.0.2 and of the `Ipc` module, which comes after
+it (0.0.3), module by module. The signatures are the
 ones in `package/*.roc`, where each public item has a `##` doc comment. `_`
 is a derived method.
 
@@ -12,8 +13,9 @@ Status:
 | tested via X | an `expect` runs it only through X |
 | not reached | no supported Roc type makes the derived code call it |
 | not in 0.0.2 | an Arrow feature this release does not have |
+| not there | not in any release |
 
-`roc test package/tests.roc` runs every `expect` (272 on
+`roc test package/tests.roc` runs every `expect` (345 on
 nightly-2026-11-15-f25da45). Each status was checked by stubbing the item
 with a `crash` and running the tests: an item marked tested or tested via X
 fails at least one `expect` when it is stubbed.
@@ -47,6 +49,7 @@ fails at least one `expect` when it is stubbed.
 | [Shape](#shape) | `Shape := [...]`, `Shape.Slot` | dynamic: schema checks |
 | [Decimal](#decimal) | `Decimal := {..}` | Decimal128 values |
 | [Timestamp, Date32, Time64, Duration, IntervalYearMonth](#logical-values) | records | temporal values |
+| [Ipc](#ipc) | `Ipc :: []` (namespace), `Ipc.Reader :: {..}` (opaque) | read the Arrow IPC streaming format; after 0.0.2 |
 
 ## DataType
 
@@ -423,5 +426,28 @@ decode and encode alike.
 | `IntervalYearMonth.from_months` | `I32 -> IntervalYearMonth` | | tested |
 | `IntervalYearMonth.parts` | `IntervalYearMonth -> { years : I32, months : I32 }` | | tested |
 | Interval(DayTime / MonthDayNano) values, a `FixedColumn` view | | | not in 0.0.2 |
-| Arrow IPC (`Ipc` module) | | | not in 0.0.2 |
 | ListView, Union, Dictionary, RunEndEncoded arrays | in `DataType` and `Format`; `from_host` gives `Unsupported` | | not in 0.0.2 |
+
+## Ipc
+
+New after 0.0.2. The Arrow IPC streaming format, read in pure Roc. A record
+batch is a non-null Struct `Array` whose children are the columns, in the
+order of the schema's fields: read it with `len`, `children`,
+`StructColumn.from_array` or `ArrowEncoding.decode_row`. `feed`, `finish`,
+`schema` and `is_ended` are methods of `Ipc.Reader` (`reader.feed(bytes)`);
+the reader's fields are not public.
+
+| Item | Signature | Purpose | Status |
+|---|---|---|---|
+| `Ipc.Err` | `[InvalidIpc(Str), Unsupported(Str)]` | bytes that are not a valid stream; an Arrow feature that is not read | tested |
+| `Ipc.read_stream` | `List(U8) -> Try({ schema : Schema, batches : List(Array) }, Ipc.Err)` | a whole stream; the end marker may be missing | tested |
+| `Ipc.Reader` | opaque | the state of a stream that is read in pieces | tested |
+| `Ipc.reader` | `Ipc.Reader` | a reader at the start of a stream | tested |
+| `feed` | `Ipc.Reader, List(U8) -> Try({ reader : Ipc.Reader, batches : List(Array) }, Ipc.Err)` | the next piece, cut anywhere: the reader afterwards and the batches the piece completed. Nothing after the end marker. After an `Err`, do not use the reader | tested |
+| `finish` | `Ipc.Reader -> Try(Schema, Ipc.Err)` | the end of the input: the schema; `InvalidIpc` inside a message or with no schema message | tested |
+| `schema` | `Ipc.Reader -> Try(Schema, [NoSchema])` | the schema, once its message has arrived | tested |
+| `is_ended` | `Ipc.Reader -> Bool` | the end marker has arrived | tested |
+| limits | 100000 fields in a schema, 64 levels of nesting, 4 times the message size for the schema's names and metadata; every vector, buffer and length is checked against the bytes | `InvalidIpc` past a limit | tested |
+| the file format (`ARROW1`), compressed bodies, dictionary batches and dictionary-encoded fields, unions, run-end encoded and list-view types, big-endian streams, metadata before V4 | reading gives `Unsupported` | | not there |
+| the framing of Arrow before 0.15 (no continuation marker) | reading gives `InvalidIpc` | | not there |
+| writing IPC | | | not there |

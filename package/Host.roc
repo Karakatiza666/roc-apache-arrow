@@ -6,6 +6,9 @@
 ## so Roc never frees or mutates it. The records use declared-order layout
 ## (the unnamed `_ : {}` field), so a host can mirror them as plain C structs.
 ## The glue header that `roc glue` writes for a platform gives the exact offsets.
+##
+## The same form, with every buffer as `U8s` bytes, is also how Roc code
+## builds an array from bytes with no host, as `Ipc` does for a record batch.
 Host :: [].{
 
 	## One Arrow buffer. The host picks the typed variant from the buffer's role
