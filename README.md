@@ -27,14 +27,14 @@ an application.
 
 ```roc
 app [main!] {
-    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.2/DNWXauUhBT2dkoJHFDfo1iJjgZAT4aKDbLv4kM2y9Ms3.tar.zst",
+    arrow: "https://github.com/Karakatiza666/roc-apache-arrow/releases/download/0.0.3/2a2ugEaCdwbdgmVurDPLWmSbSdFfEWxdUJys9wTBPGoE.tar.zst",
 }
 
 import arrow.Array
 import arrow.PrimitiveColumn
 ```
 
-The URL is the 0.0.2 release bundle. Its file name is the hash of its
+The URL is the 0.0.3 release bundle. Its file name is the hash of its
 content, so it changes when a module changes. The release notes give the
 URL of each release.
 
